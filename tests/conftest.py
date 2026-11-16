@@ -145,6 +145,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(302, headers={"Location": "http://10.0.0.1/admin"})
             if path == "/product":
                 return self._send(200, PRODUCT_PAGE)
+            if path == "/gzip-bomb":
+                import gzip as _gz
+                bomb = _gz.compress(b"<html><body>" + b"0" * (20 * 1024 * 1024) + b"</body></html>", compresslevel=9)
+                return self._send(200, bomb, headers={"Content-Encoding": "gzip"})
             if path == "/js-challenge":
                 if cookies.get("passed") == "1":
                     return self._send(200, "<html><head><title>Real page</title></head><body><h1>Real content</h1><p>"

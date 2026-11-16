@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
 from curl_cffi import AsyncCurl, CurlInfo, CurlOpt
+from curl_cffi.curl import CURL_WRITEFUNC_ERROR
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException
 
@@ -185,6 +186,20 @@ class HttpFetcher:
                 # Per-hop options (DNS pin, size cap). The session belongs to this request
                 # only, so replacing its option dict between hops is safe.
                 session.curl_options = curl_options
+                # Collect the body ourselves: libcurl hands the write callback *decoded*
+                # bytes, so the size cap also stops gzip/brotli decompression bombs, which
+                # CURLOPT_MAXFILESIZE (checked on the wire) does not.
+                buf = bytearray()
+                overflow = False
+
+                def sink(chunk: bytes, _buf=buf) -> int:
+                    nonlocal overflow
+                    if len(_buf) + len(chunk) > max_bytes:
+                        overflow = True
+                        return CURL_WRITEFUNC_ERROR
+                    _buf.extend(chunk)
+                    return len(chunk)
+
                 try:
                     resp = await session.get(
                         current,
@@ -192,10 +207,14 @@ class HttpFetcher:
                         allow_redirects=False,
                         timeout=remaining,
                         proxy=s.proxy,
+                        content_callback=sink,
                         **kwargs,
                     )
                 except RequestException as exc:
+                    if overflow:
+                        raise FetchError("too_large", f"response is larger than {max_bytes} bytes", hops=hops, gates=gates) from exc
                     raise FetchError(_curl_error_code(exc), str(exc).split(". See ")[0][:300], hops=hops, gates=gates) from exc
+                body = bytes(buf)
                 hop_ms = (time.monotonic() - hop_start) * 1000
                 remote_ip = resp.primary_ip or ""
                 if s.proxy is None and remote_ip and not s.allow_private and not ip_is_public(remote_ip):
@@ -210,7 +229,7 @@ class HttpFetcher:
                     continue
 
                 if resolve_gates and gate_actions < MAX_GATE_ACTIONS:
-                    head = resp.content[:262144].decode("utf-8", "replace")
+                    head = body[:262144].decode("utf-8", "replace")
                     action = check_response(original_url=target.url, url=current, status=status,
                                             location=location, head=head)
                     if action is not None:
@@ -229,10 +248,10 @@ class HttpFetcher:
                     current = urljoin(current, location.strip())
                     continue
 
-                if status == 200 and len(resp.content) < 16384 and meta_refreshes < MAX_META_REFRESH:
+                if status == 200 and len(body) < 16384 and meta_refreshes < MAX_META_REFRESH:
                     # A refresh inside <noscript> only fires for browsers with JavaScript off;
                     # following it lands on "JavaScript required" pages a real visitor never sees.
-                    m = _META_REFRESH.search(_NOSCRIPT.sub(b"", resp.content))
+                    m = _META_REFRESH.search(_NOSCRIPT.sub(b"", body))
                     if m and int(m.group(1)) <= 5:
                         meta_refreshes += 1
                         current = urljoin(current, _html.unescape(m.group(2).decode("latin-1")))
@@ -260,7 +279,7 @@ class HttpFetcher:
                 final_url=current,
                 status=resp.status_code,
                 headers=resp_headers,
-                body=resp.content,
+                body=body,
                 http_version=_HTTP_VERSIONS.get(int(resp.http_version or 0), str(resp.http_version)),
                 remote_ip=resp.primary_ip or "",
                 hops=hops,

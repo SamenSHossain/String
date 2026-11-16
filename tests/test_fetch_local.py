@@ -225,3 +225,10 @@ def test_golem_accept_endpoint(server, settings, monkeypatch):
     assert res.status == 200 and b"IT-News" in res.body
     calls = [h.url for h in res.hops if "setconsentcookie.php" in h.url]
     assert calls and "type=cmp" in calls[0] and "version=%7C261101" in calls[0]
+
+
+def test_decompression_bomb_is_capped(server, settings):
+    port = server.server_address[1]
+    with pytest.raises(FetchError) as exc:
+        run(_fetch(settings, f"http://echo.test:{port}/gzip-bomb", max_bytes=1024 * 1024))
+    assert exc.value.code == "too_large"
