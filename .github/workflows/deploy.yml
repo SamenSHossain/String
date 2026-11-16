@@ -1,0 +1,75 @@
+name: test-and-deploy
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Modal credentials
+        id: creds
+        shell: bash
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Repository secrets MODAL_TOKEN_ID / MODAL_TOKEN_SECRET are not set; skipping deploy."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Modal client
+        if: steps.creds.outputs.present == 'true'
+        run: pip install "modal==1.6.4"
+      - name: Deploy API
+        if: steps.creds.outputs.present == 'true'
+        shell: bash
+        run: modal deploy modal_app.py 2>&1 | tee deploy.log
+      - name: Deploy headless-browser tier
+        if: steps.creds.outputs.present == 'true'
+        continue-on-error: true
+        shell: bash
+        run: modal deploy modal_browser.py 2>&1 | tee deploy-browser.log
+      - name: Smoke test the deployed endpoint
+        if: steps.creds.outputs.present == 'true'
+        shell: bash
+        run: |
+          URL="$(grep -oE 'https://[a-z0-9-]+--webfetch\.modal\.run' deploy.log | head -1)"
+          echo "Endpoint: $URL"
+          echo "### Endpoint: $URL" >> "$GITHUB_STEP_SUMMARY"
+          python bench/smoke.py "$URL" | tee smoke.jsonl
+      - name: Upload smoke results
+        if: steps.creds.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-results
+          path: |
+            smoke.jsonl
+            deploy.log
+            deploy-browser.log
