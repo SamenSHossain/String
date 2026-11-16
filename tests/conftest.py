@@ -148,6 +148,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(302, headers={"Location": "http://10.0.0.1/admin"})
             if path == "/product":
                 return self._send(200, PRODUCT_PAGE)
+            if path == "/soft-limit":
+                return self._send(200, "<html><body><table><tr><td>Hacker News</td></tr></table>"
+                                       "<p>Sorry, we're not able to serve your requests this quickly.</p></body></html>")
+            if path == "/doc.pdf":
+                return self._send(200, b"%PDF-1.7\n" + bytes(range(256)) * 8, headers={"Content-Type": "application/pdf"})
+            if path == "/slow":
+                import time as _t
+                _t.sleep(3)
+                return self._send(200, "<html><body>late</body></html>")
             if path == "/utf8-redirect":
                 self.send_response(302)
                 self.send_header("Location", "/caf\u00e9-r\u00e9sum\u00e9".encode("utf-8").decode("latin-1"))

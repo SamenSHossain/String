@@ -77,7 +77,10 @@ def _validate(expect: Expect | None, page: Page) -> dict | None:
     for s in expect.not_contains:
         checks.append({"check": "notContains", "value": s, "passed": s.lower() not in hay})
     if expect.selector:
-        found = bool(page.tree is not None and page.tree.css_first(expect.selector) is not None)
+        try:
+            found = bool(page.tree is not None and page.tree.css_first(expect.selector) is not None)
+        except Exception:
+            found = False
         checks.append({"check": "selector", "value": expect.selector, "passed": found})
     if expect.min_chars is not None:
         checks.append({"check": "minChars", "value": expect.min_chars, "actual": len(page.visible),
@@ -140,8 +143,17 @@ def _browser_result(url: str, data: dict[str, Any], gates: list[GateEvent]) -> F
     )
 
 
+MIN_ESCALATION_SECONDS = 2.0
+
+
 async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserClient | None) -> dict[str, Any]:
     t0 = time.monotonic()
+    # One budget for the whole request: every attempt gets what is left of it.
+    budget = min(opts.timeout or fetcher.settings.default_timeout, fetcher.settings.max_timeout)
+    deadline = t0 + budget
+
+    def left() -> float:
+        return deadline - time.monotonic()
     attempts: list[dict] = []
     best: Page | None = None
     last_error: FetchError | None = None
@@ -151,7 +163,7 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
         a0 = time.monotonic()
         try:
             res = await fetcher.fetch(
-                opts.url, headers=opts.headers, cookies=opts.cookies, timeout=opts.timeout,
+                opts.url, headers=opts.headers, cookies=opts.cookies, timeout=max(left(), 0.5),
                 resolve_gates=opts.resolve_gates, max_bytes=opts.max_bytes, impersonate=impersonate,
             )
         except FetchError as exc:
@@ -170,13 +182,12 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
         if browser is None:
             return None
         a0 = time.monotonic()
-        remaining = (opts.timeout or fetcher.settings.default_timeout) + 15
         try:
-            data = await browser.render(
+            data = await asyncio.wait_for(browser.render(
                 normalize_url(opts.url).url,
                 cookies=_browser_cookies(opts.url, opts.cookies, opts.resolve_gates),
-                headers=opts.headers, timeout=min(remaining, fetcher.settings.max_timeout),
-            )
+                headers=opts.headers, timeout=max(left() - 1.0, 1.0),
+            ), timeout=max(left(), 1.0))
         except Exception as exc:  # browser tier is best effort
             attempts.append({"strategy": "browser:chromium", "error": "browser_error",
                              "message": str(exc)[:300], "ms": round((time.monotonic() - a0) * 1000, 1)})
@@ -203,12 +214,12 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
         best = await http_attempt(None)
         refused = (best is not None and not best.verdict.ok and best.verdict.outcome in {"challenge", "blocked", "rate_limited"}) \
             or (best is None and last_error is not None and last_error.code in {"http2_error", "connection_error", "tls_error"})
-        if refused:
+        if refused and left() > MIN_ESCALATION_SECONDS:
             alt = await http_attempt(ALT_IMPERSONATE)
             if alt is not None and (best is None or _good(alt) or (not best.verdict.ok and alt.verdict.ok)):
                 best = alt
         needs_browser = best is None or not _good(best)
-        if needs_browser and opts.render == "auto" and browser is not None:
+        if needs_browser and opts.render == "auto" and browser is not None and left() > MIN_ESCALATION_SECONDS:
             if best is None or best.verdict.browser_may_help or (best.verdict.ok and not _good(best)):
                 rendered = await browser_attempt()
                 if rendered is not None and (best is None or _good(rendered) or
@@ -241,10 +252,11 @@ def _render_outputs(page: Page, opts: FetchOptions) -> dict[str, Any]:
     r = page.result
     v = page.verdict
     ok = v.ok and (page.validation is None or page.validation["passed"])
+    validation_failed = v.ok and page.validation is not None and not page.validation["passed"]
     env: dict[str, Any] = {
         "ok": ok,
-        "outcome": v.outcome if (page.validation is None or page.validation["passed"] or not v.ok) else "validation_failed",
-        "reason": v.reason if (page.validation is None or page.validation["passed"]) else "expect checks failed",
+        "outcome": "validation_failed" if validation_failed else v.outcome,
+        "reason": "expect checks failed" if validation_failed else v.reason,
         "vendor": v.vendor,
         "url": r.requested_url,
         "finalUrl": r.final_url,
@@ -293,9 +305,12 @@ def _render_outputs(page: Page, opts: FetchOptions) -> dict[str, Any]:
             filled["ms"] = round((time.monotonic() - t) * 1000, 2)
             env["extracted"] = filled
     elif _is_textual(page.content_type):
-        if fmt in ("markdown", "text") or "markdown" in want or "text" in want:
-            key = "markdown" if (fmt == "markdown" or "markdown" in want) else "text"
-            env[key] = page.text
+        if fmt == "markdown" or "markdown" in want:
+            env["markdown"] = page.text
+        if fmt == "text" or "text" in want:
+            env["text"] = page.text
+    elif fmt in ("markdown", "text", "html"):
+        env["_unsupported"] = True  # binary (PDF, image, ...): the API answers 415
     if (fmt == "html" or "html" in want) and (page.is_html or _is_textual(page.content_type)):
         env["html"] = page.text
     if fmt == "raw":

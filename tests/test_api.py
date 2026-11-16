@@ -115,3 +115,38 @@ def test_raw_utf8_location_does_not_500(server, client):
     r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/utf8-redirect", "format": "markdown"})
     assert r.status_code == 200, r.text
     assert r.headers["x-final-url"].endswith("/caf%C3%A9-r%C3%A9sum%C3%A9")
+
+
+def test_soft_rate_limit_is_a_502_not_content(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/soft-limit", "format": "markdown"})
+    assert r.status_code == 502 and r.json()["outcome"] == "rate_limited"
+
+
+def test_raw_keeps_original_bytes_and_labels_their_charset(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/sjis", "format": "raw"})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "text/html; charset=Shift_JIS"
+    assert "日本語".encode("cp932") in r.content
+
+
+def test_binary_as_markdown_is_415(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/doc.pdf", "format": "markdown"})
+    assert r.status_code == 415 and r.json()["error"] == "unsupported_content"
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/doc.pdf", "format": "raw"})
+    assert r.status_code == 200 and r.content.startswith(b"%PDF")
+
+
+def test_invalid_selector_is_400(client):
+    r = client.post("/v1/fetch", json={"url": "https://example.com", "expect": {"selector": "div[["}})
+    assert r.status_code == 400 and r.json()["error"] == "validation_error"
+
+
+def test_timeout_is_one_budget_for_the_request(server, client):
+    import time
+    port = server.server_address[1]
+    t0 = time.monotonic()
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/slow", "timeout": 1})
+    assert r.status_code == 504 and time.monotonic() - t0 < 2.5

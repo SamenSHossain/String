@@ -145,3 +145,68 @@ def test_microdata_walk_is_linear():
     items = extract.microdata(extract.parse(html), "https://x/")
     assert items[0]["name"] == "N"
     assert time.perf_counter() - t < 2.0
+
+
+# --- regressions from the independent review -------------------------------------------
+
+LONG = "<p>" + "Real paragraph text about the topic at hand. " * 70 + "</p>"
+
+
+def test_vendor_names_in_prose_are_not_challenges():
+    for snippet in ("Request unsuccessful. Incapsula incident ID: 123-456", "Sucuri Website Firewall",
+                    "window.awsWafCookieDomainList", "geo.captcha-delivery.com", "errors.edgesuite.net"):
+        page = f"<html><head><title>How bot walls work</title></head><body>{LONG}<pre>{snippet}</pre></body></html>"
+        assert _verdict(200, page).outcome == "ok", snippet
+
+
+def test_cloudflare_origin_error_is_server_error():
+    page = '<html><head><title>example.com | 522: Connection timed out</title></head><body><div id="cf-error-details">' \
+           "The origin web server timed out responding to this request.</div></body></html>"
+    v = _verdict(522, page)
+    assert v.outcome == "server_error" and v.vendor == "cloudflare"
+
+
+def test_imperva_sitewide_script_is_not_a_challenge():
+    page = f'<html><head><script src="/_Incapsula_Resource?SWJIYLWA=719d34d31c8e3a6e6fffd425f7e032f3"></script></head><body>{LONG}</body></html>'
+    assert _verdict(200, page).outcome == "ok"
+    block = '<html><body><iframe src="/_Incapsula_Resource?CWUDNSAI=24&xinfo=1"></iframe>Incapsula incident ID: 1</body></html>'
+    assert _verdict(200, block).outcome == "challenge"
+
+
+def test_sitewide_scripts_on_small_pages():
+    small = "<html><head><script src='/cdn-cgi/challenge-platform/scripts/jsd/main.js'></script></head><body>" \
+            + "<p>Release notes for version 2.4. " * 20 + "</p></body></html>"
+    assert _verdict(200, small).outcome == "ok"
+    nf = "<html><head><script src='https://www.google.com/recaptcha/api.js?render=x'></script></head><body>Page not found</body></html>"
+    assert _verdict(404, nf).outcome == "not_found"
+
+
+def test_tiny_real_page_is_ok():
+    example = ("<!doctype html><html><head><title>Example Domain</title></head><body><div><h1>Example Domain</h1>"
+               "<p>This domain is for use in documentation examples without needing permission.</p>"
+               '<p><a href="https://iana.org/domains/example">Learn more</a></p></div></body></html>')
+    assert _verdict(200, example).outcome == "ok"
+
+
+def test_canonicalising_redirect_is_not_a_gate():
+    article = f"<html><head><title>What age verification laws require</title></head><body>{LONG}</body></html>"
+    assert _verdict(200, article, url="https://news.example/explainers/age-verification",
+                    final="https://news.example/explainers/age-verification/").outcome == "ok"
+
+
+def test_cp1252_page_with_a_stray_utf8_fragment_keeps_its_charset():
+    page = ("<html><body><p>" + "Café crème brûlée à la française. " * 30 + "</p><p>Łódź</p></body></html>")
+    raw = page.replace("Łódź", "Łodz").encode("cp1252", errors="ignore")  # Ł is not in cp1252
+    raw = raw.replace(b"odz", b"\xc5\x81odz")  # embed UTF-8 'Ł' bytes (C5 81) as CMS fields do
+    text, enc, src = decode_body(raw, "text/html; charset=windows-1252")
+    assert enc == "cp1252" and src == "http-header"
+    assert "Café crème brûlée" in text
+
+
+def test_nan_in_json_ld_is_dropped():
+    tree = extract.parse('<script type="application/ld+json">{"@type":"Product","name":"X",'
+                         '"aggregateRating":{"ratingValue":NaN,"reviewCount":Infinity}}</script>')
+    ld = extract.json_ld(tree)
+    assert ld[0]["aggregateRating"] == {"ratingValue": None, "reviewCount": None}
+    import json
+    json.dumps(ld, allow_nan=False)  # serializable

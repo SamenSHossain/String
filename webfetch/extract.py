@@ -88,18 +88,22 @@ def page_metadata(tree: LexborHTMLParser, base_url: str) -> dict[str, Any]:
     }
 
 
+def _no_constant(_name: str) -> None:
+    return None  # NaN / Infinity in JSON-LD: not valid JSON, and not serializable back out
+
+
 def _loads_lenient(raw: str) -> Any:
     raw = raw.strip()
     raw = re.sub(r"^\s*(<!--|//\s*<!\[CDATA\[|<!\[CDATA\[)", "", raw)
     raw = re.sub(r"(-->|//\s*\]\]>|\]\]>)\s*$", "", raw).strip()
     try:
-        return json.loads(raw)
+        return json.loads(raw, parse_constant=_no_constant)
     except json.JSONDecodeError:
         pass
     cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", raw)  # raw control chars
     cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)  # trailing commas
     try:
-        return json.loads(cleaned, strict=False)
+        return json.loads(cleaned, strict=False, parse_constant=_no_constant)
     except json.JSONDecodeError:
         return None
 

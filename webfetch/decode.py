@@ -59,6 +59,18 @@ _BOMS = (
 )
 
 
+# WHATWG single-byte decoders map every byte; Python's cp125x leave a few undefined
+# (0x81, 0x8D, 0x8F, 0x90, 0x9D in cp1252). Browsers render those as the C1 control with
+# the same number, so a stray byte must not throw away the declared charset.
+def _c1_passthrough(err: UnicodeDecodeError):
+    return "".join(chr(b) for b in err.object[err.start:err.end]), err.end
+
+
+codecs.register_error("whatwg_c1", _c1_passthrough)
+_SINGLE_BYTE = {"cp1250", "cp1251", "cp1252", "cp1253", "cp1254", "cp1255", "cp1256", "cp1257", "cp1258",
+                "cp874", "koi8_r", "koi8_u", "iso8859_2", "iso8859_5", "iso8859_7", "iso8859_15", "mac_roman"}
+
+
 def normalize_label(label: str | None) -> str | None:
     if not label:
         return None
@@ -102,6 +114,8 @@ def decode_body(data: bytes, content_type: str | None = None) -> tuple[str, str,
 
     for enc, source in candidates:
         try:
+            if enc.replace("-", "_") in _SINGLE_BYTE:
+                return data.decode(enc, errors="whatwg_c1"), enc, source
             return data.decode(enc), enc, source
         except (UnicodeDecodeError, LookupError):
             continue  # declared charset is wrong; fall through to the next rule

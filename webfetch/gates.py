@@ -257,11 +257,14 @@ class GolemConsent(CookieRetryRecipe):
 
 
 class GoogleConsent(Recipe):
-    """consent.google.* / consent.youtube.com interstitials (served to EU visitors)."""
+    """consent.google.<tld> / consent.youtube.com interstitials (served to EU visitors)."""
 
     name = "google-consent"
-    domains = ("google.com", "youtube.com", "google.de", "google.co.uk", "google.fr", "google.nl",
-               "google.it", "google.es", "google.pl", "google.at", "google.be", "google.ch")
+    _HOST = re.compile(r"(?:^|\.)(google\.(?:com?\.)?[a-z]{2,3}|youtube\.com)$")
+
+    def applies(self, host: str) -> str | None:
+        m = self._HOST.search(host)
+        return m.group(1) if m else None
 
     def preset(self, host: str) -> dict[str, str]:
         return {"SOCS": "CAI"}  # "reject all" consent record: essential cookies only
@@ -272,7 +275,8 @@ class GoogleConsent(Recipe):
         if not (host.startswith("consent.google.") or host == "consent.youtube.com"):
             return None
         back = (parse_qs(urlsplit(target).query).get("continue") or [original_url])[0]
-        base = self.applies(_host(back)) or self.applies(_host(original_url)) or "google.com"
+        # The cookie must be set on the site being returned to (google.se, google.co.uk, ...).
+        base = self.applies(_host(back)) or self.applies(_host(original_url)) or host.split(".", 1)[1]
         return GateAction(
             url=back,
             cookies={"SOCS": "CAI"},

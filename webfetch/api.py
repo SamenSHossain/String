@@ -31,7 +31,12 @@ log = logging.getLogger("webfetch")
 
 # Outcomes that mean "we could not get past what the destination served".
 FAILED_OUTCOMES = {"challenge", "blocked", "consent_wall", "age_gate", "login_wall", "js_required",
-                   "empty", "validation_failed"}
+                   "empty", "validation_failed", "rate_limited"}
+# Python codec name -> the label browsers and HTTP clients expect in Content-Type.
+_CHARSET_LABELS = {"cp932": "Shift_JIS", "gb18030": "GB18030", "big5hkscs": "Big5", "cp949": "EUC-KR",
+                   "cp1252": "windows-1252", "cp1251": "windows-1251", "cp1250": "windows-1250",
+                   "cp1253": "windows-1253", "cp1254": "windows-1254", "cp874": "windows-874",
+                   "koi8-r": "KOI8-R", "euc_jp": "EUC-JP", "utf-8": "utf-8"}
 FORBIDDEN_HEADERS = {"host", "connection", "content-length", "transfer-encoding", "te", "upgrade",
                      "keep-alive", "trailer", "proxy-authorization", "proxy-authenticate", "proxy-connection"}
 MAX_SCHEMA_BYTES = 50_000
@@ -44,6 +49,18 @@ class ExpectModel(BaseModel):
     notContains: list[str] | str | None = None
     selector: str | None = Field(None, max_length=500)
     minChars: int | None = Field(None, ge=0, le=50_000_000)
+
+    @field_validator("selector")
+    @classmethod
+    def _selector(cls, v):
+        if v is None:
+            return v
+        from selectolax.lexbor import LexborHTMLParser
+        try:
+            LexborHTMLParser("<p></p>").css_first(v)
+        except Exception as exc:
+            raise ValueError(f"invalid CSS selector: {exc}") from exc
+        return v
 
 
 class FetchBody(BaseModel):
@@ -268,6 +285,11 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
         if outcome == "fetch_error":
             status = 504 if env.get("error") == "timeout" else 502
             return JSONResponse(env, status_code=status, headers=hdrs)
+        if env.pop("_unsupported", False) and body.format in ("markdown", "text", "html"):
+            env.update({"error": "unsupported_content",
+                        "message": f"{env.get('contentType') or 'this content'} cannot be returned as {body.format}; "
+                                   "use format raw or json"})
+            return JSONResponse(env, status_code=415, headers=hdrs)
         failed = outcome in FAILED_OUTCOMES
         if body.format == "json":
             return JSONResponse(env, status_code=502 if failed else 200, headers=hdrs)
@@ -280,7 +302,12 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
             return Response(env.get("text") or "", media_type="text/plain; charset=utf-8", headers=hdrs)
         if body.format == "raw":
             hdrs["x-encoding"] = env.get("encoding", "")
-            return Response(raw or b"", media_type=env.get("contentType") or "application/octet-stream", headers=hdrs)
+            ctype = env.get("contentType") or "application/octet-stream"
+            if "charset=" not in ctype.lower() and (ctype.startswith("text/") or "html" in ctype or "xml" in ctype):
+                # Original bytes in their original encoding: label it, or clients assume UTF-8.
+                ctype = f"{ctype}; charset={_CHARSET_LABELS.get(env.get('encoding', ''), env.get('encoding') or 'utf-8')}"
+            hdrs["content-type"] = ctype
+            return Response(raw or b"", headers=hdrs)
         return Response((env.get("html") or "").encode("utf-8"), media_type="text/html; charset=utf-8", headers=hdrs)
 
     @app.get("/")

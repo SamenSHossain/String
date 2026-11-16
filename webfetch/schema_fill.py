@@ -10,6 +10,7 @@ and the whole pass takes milliseconds instead of an LLM round trip.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -123,28 +124,46 @@ def _types_of(node: dict) -> list[str]:
 
 
 def _entity_rank(types: list[str]) -> int:
+    """0 = the page's main entity (Product, Article, ...); 1 is reserved for page-level
+    facts (canonical URL, OpenGraph, title); 2 = other entities; 3 = site boilerplate."""
     low = {t.lower() for t in types}
     if low & _MAIN_TYPES:
         return 0
     if low and low <= _BOILERPLATE_TYPES:
-        return 2
-    return 1
+        return 3
+    return 2
 
 
-def _walk(node: Any, path: str, source: str, entity: int, depth: int, out: list[Cand]) -> None:
+# Keys that lead into a *different* entity (the author, the publisher, a review...). A
+# generic field such as "name" or "url" found under them describes that other entity, so
+# it ranks below the page's own value unless the requested field is about that entity.
+_FOREIGN = {"author", "creator", "publisher", "brand", "manufacturer", "review", "reviews", "ispartof",
+            "mainentityofpage", "breadcrumb", "itemlistelement", "provider", "seller", "sourceorganization",
+            "copyrightholder", "contributor", "editor", "logo", "potentialaction", "about", "mentions",
+            "hasmap", "subjectof", "workexample", "parentorganization", "founder", "employee", "member",
+            "image", "thumbnail", "thumbnailurl", "video", "audio", "associatedmedia", "primaryimageofpage"}
+
+
+def _walk(node: Any, path: str, source: str, entity: int, depth: int, out: list[Cand],
+          index: dict[str, dict] | None = None, seen: frozenset = frozenset()) -> None:
     if depth > 8:
         return
     if isinstance(node, dict):
         for k, v in node.items():
             if k in ("@context",) or (k.startswith("@") and k not in ("@id", "@value")):
                 continue
+            # {"@id": "...#primaryimage"} points at another node of the @graph: use that node.
+            if isinstance(v, dict) and index and set(v) <= {"@id", "@type"} and v.get("@id") in index \
+                    and v["@id"] not in seen:
+                v = index[v["@id"]]
+                seen = seen | {v.get("@id")}
             p = f"{path}.{k}" if path else k
             out.append(Cand(norm(k), p, v, source, entity, depth))
             if isinstance(v, (dict, list)):
-                _walk(v, p, source, entity, depth + 1, out)
+                _walk(v, p, source, entity, depth + 1, out, index, seen)
     elif isinstance(node, list):
         for item in node[:200]:
-            _walk(item, path, source, entity, depth, out)
+            _walk(item, path, source, entity, depth, out, index, seen)
 
 
 def build_candidates(
@@ -157,13 +176,14 @@ def build_candidates(
     out: list[Cand] = []
     for key, (value, path) in (site or {}).items():
         out.append(Cand(norm(key), path, value, "site", 0, 0))
+    index = {n["@id"]: n for n in jsonld if isinstance(n, dict) and isinstance(n.get("@id"), str)}
     for source, nodes in (("json-ld", jsonld), ("microdata", microdata)):
         for node in nodes:
             if not isinstance(node, dict):
                 continue
             types = _types_of(node)
             label = types[0] if types else "Thing"
-            _walk(node, label, source, _entity_rank(types), 0, out)
+            _walk(node, label, source, _entity_rank(types), 0, out, index if source == "json-ld" else None)
     for key, value in (metadata.get("openGraph") or {}).items():
         out.append(Cand(norm(key.split(":", 1)[-1]) if key.startswith("og:") else norm(key), key, value, "meta", 1, 0))
         out.append(Cand(norm(key), key, value, "meta", 1, 0))
@@ -174,7 +194,7 @@ def build_candidates(
                             ("siteName", "sitename"), ("image", "image")):
         v = metadata.get(field_name)
         if v:
-            out.append(Cand(key, f"meta:{field_name}", v, "meta", 1, 0))
+            out.append(Cand(key, field_name, v, "meta", 1, 0))
     for field_name, key in (("h1", "h1"), ("language", "lang"), ("canonicalUrl", "canonical"), ("title", "pagetitle")):
         v = metadata.get(field_name)
         if v:
@@ -197,7 +217,7 @@ def parse_number(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        return float(value) if math.isfinite(value) else None
     if not isinstance(value, str):
         return None
     s = value.strip()
@@ -216,6 +236,8 @@ def parse_number(value: Any) -> float | None:
         raw = raw.replace(",", ".") if raw.count(",") == 1 and len(tail) in (1, 2) else raw.replace(",", "")
     elif raw.count(".") > 1:
         raw = raw.replace(".", "")
+    elif raw.count(".") == 1 and len(raw.rsplit(".", 1)[1]) == 3 and re.search(r"€|,-|\bkr\b|\bzł|\bkč", s, re.I):
+        raw = raw.replace(".", "")  # "1.299 €", "€ 1.299,-": European thousands separator
     try:
         return float(raw)
     except ValueError:
@@ -232,7 +254,7 @@ def _to_text(value: Any, join: bool) -> str | None:
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, dict):
-        for k in ("name", "@value", "text", "url", "contentUrl", "@id"):
+        for k in ("name", "@value", "text", "url", "contentUrl"):
             if isinstance(value.get(k), (str, int, float)):
                 return str(value[k]).strip() or None
         return None
@@ -271,24 +293,49 @@ def _to_bool(value: Any) -> bool | None:
     return None
 
 
-def _as_list(value: Any) -> list:
+def _as_list(value: Any, split: bool = True) -> list:
     if value is None:
         return []
     if isinstance(value, list):
         return value
-    if isinstance(value, str) and "," in value and len(value) < 500:
+    if (split and isinstance(value, str) and "," in value and len(value) < 500
+            and not re.match(r"^\s*(https?:)?//", value)):
         return [v.strip() for v in value.split(",") if v.strip()]
     return [value]
+
+
+_URLISH = re.compile(r"^(https?://|//|/|\./|\.\./|data:)|^[^\s/]+\.[a-z]{2,}(/|$)|^[\w\-./%~]+\.(jpe?g|png|gif|webp|avif|svg)(\?|$)", re.I)
 
 
 # --------------------------------------------------------------------------- filling
 
 class SchemaFiller:
-    def __init__(self, cands: list[Cand], base_url: str):
+    def __init__(self, cands: list[Cand], base_url: str, root: dict | None = None):
         self.cands = cands
         self.base_url = base_url
+        self.root = root or {}
         self.sources: dict[str, str] = {}
         self.missing: list[str] = []
+
+    def _norm(self, schema: Any, depth: int = 0) -> dict:
+        """Resolve $ref and collapse nullable anyOf/oneOf (the shape Pydantic emits)."""
+        if not isinstance(schema, dict) or depth > 20:
+            return schema if isinstance(schema, dict) else {}
+        ref = schema.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/"):
+            target: Any = self.root
+            for part in ref[2:].split("/"):
+                target = target.get(part, {}) if isinstance(target, dict) else {}
+            merged = {**target, **{k: v for k, v in schema.items() if k != "$ref"}}
+            return self._norm(merged, depth + 1)
+        for key in ("anyOf", "oneOf"):
+            options = schema.get(key)
+            if isinstance(options, list):
+                real = [o for o in options if not (isinstance(o, dict) and o.get("type") == "null")]
+                if len(real) == 1:
+                    merged = {**self._norm(real[0], depth + 1), **{k: v for k, v in schema.items() if k != key}}
+                    return merged
+        return schema
 
     def _ranked(self, prop: str, description: str = "", pool: list[Cand] | None = None) -> list[Cand]:
         pool = self.cands if pool is None else pool
@@ -300,6 +347,7 @@ class SchemaFiller:
                     concept = _SYNONYMS[word]
                     break
         keys = _CONCEPT_KEYS.get(concept or "", [])
+        wanted = {p, concept or ""}
         scored = []
         for c in pool:
             if c.key == p:
@@ -308,12 +356,19 @@ class SchemaFiller:
                 kind = 1 + keys.index(c.key)
             else:
                 continue
-            scored.append(((kind if c.source != "site" else -1, _SOURCE_RANK[c.source], c.entity, c.depth), c))
+            # Inside another entity (Article.author.name for "name")? Rank it below the page's own.
+            segments = {norm(seg) for seg in c.path.split(".")[1:-1]}
+            foreign = bool(segments & _FOREIGN) and not (segments & wanted)
+            # Curated site fields first; then the page's main entity before other entities, so
+            # Article.headline beats a Person node's exact "name"; then match quality and source.
+            rank = (-1 if c.source == "site" else 0, 1 if foreign else 0, c.entity, kind, _SOURCE_RANK[c.source], c.depth)
+            scored.append((rank, c))
         scored.sort(key=lambda x: x[0])
         return [c for _, c in scored]
 
     def fill(self, schema: dict, prop: str = "", path: str = "", pool: list[Cand] | None = None,
              description: str = "") -> Any:
+        schema = self._norm(schema)
         stype = schema.get("type")
         if isinstance(stype, list):
             stype = next((t for t in stype if t != "null"), None)
@@ -333,21 +388,27 @@ class SchemaFiller:
         return None
 
     def _fill_object(self, schema: dict, path: str, pool: list[Cand] | None) -> dict:
+        schema = self._norm(schema)
         out = {}
         for name, sub in (schema.get("properties") or {}).items():
+            sub = self._norm(sub)
             if not isinstance(sub, dict):
                 continue
             sub_path = f"{path}.{name}" if path else name
             sub_type = sub.get("type")
             if sub_type == "object" or isinstance(sub.get("properties"), dict):
                 scoped = self._scoped_pool(name, pool)
-                out[name] = self._fill_object(sub, sub_path, scoped or pool)
+                out[name] = self._fill_object(sub, sub_path, pool if scoped is None else scoped)
             else:
                 out[name] = self.fill(sub, name, sub_path, pool, str(sub.get("description") or ""))
         return out
 
     def _scoped_pool(self, name: str, pool: list[Cand] | None) -> list[Cand] | None:
-        """Candidates read from inside the JSON-LD/microdata object whose key matches ``name``."""
+        """Candidates read from inside the object whose key matches ``name``.
+
+        None when the page has no such key (the schema just groups fields: fill from the
+        whole page). When the key holds a plain string ("author": "Staff Reporter"), the
+        object is filled from that string alone (as its name), never from other entities."""
         for c in self._ranked(name, "", pool):
             if isinstance(c.value, dict):
                 sub: list[Cand] = []
@@ -357,20 +418,24 @@ class SchemaFiller:
                 sub = []
                 _walk(c.value[0], c.path, c.source, c.entity, c.depth + 1, sub)
                 return sub
+            if isinstance(c.value, (str, int, float)) and str(c.value).strip():
+                return [Cand("name", c.path, c.value, c.source, c.entity, c.depth)]
         return None
 
     def _fill_array(self, schema: dict, prop: str, path: str, ranked: list[Cand]) -> list | None:
-        items_schema = schema.get("items") if isinstance(schema.get("items"), dict) else {}
+        items_schema = self._norm(schema.get("items")) if isinstance(schema.get("items"), dict) else {}
         item_type = items_schema.get("type")
+        concept = _concept(norm(prop))
+        url_items = (items_schema.get("format") in ("uri", "url", "iri")) or concept in {"image", "url"}
         for c in ranked:
-            values = _as_list(c.value)
+            values = _as_list(c.value, split=not url_items)
             out = []
             for v in values:
                 if item_type == "object" or isinstance(items_schema.get("properties"), dict):
                     if isinstance(v, dict):
                         sub: list[Cand] = []
                         _walk(v, c.path, c.source, c.entity, c.depth + 1, sub)
-                        sub_filler = SchemaFiller(sub, self.base_url)
+                        sub_filler = SchemaFiller(sub, self.base_url, self.root)
                         out.append(sub_filler._fill_object(items_schema, "", sub))
                     continue
                 coerced = self._coerce(items_schema, item_type, v, prop)
@@ -395,7 +460,7 @@ class SchemaFiller:
             if isinstance(value, list):
                 value = next((v for v in value if parse_number(v) is not None), None)
             n = parse_number(value)
-            if n is None:
+            if n is None or not math.isfinite(n):
                 return None
             return int(round(n)) if stype == "integer" else n
         if stype == "boolean":
@@ -404,6 +469,8 @@ class SchemaFiller:
         if text is None:
             return None
         if fmt in ("uri", "url", "iri") or concept in {"image", "url"}:
+            if not _URLISH.search(text.strip()):
+                return None  # "Daily Planet" is not a URL; never build one from text
             if not text.startswith(("http://", "https://", "data:")):
                 text = urljoin(self.base_url, text)
         elif fmt in ("date", "date-time"):
@@ -423,7 +490,7 @@ class SchemaFiller:
 
 
 def fill_schema(schema: dict, cands: list[Cand], base_url: str) -> dict[str, Any]:
-    filler = SchemaFiller(cands, base_url)
+    filler = SchemaFiller(cands, base_url, root=schema)
     data = filler.fill(schema)
     total = len(filler.sources) + len(filler.missing)
     required = [r for r in (schema.get("required") or []) if isinstance(r, str)]
