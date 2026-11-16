@@ -215,3 +215,13 @@ def test_js_required_page_is_flagged(server, settings):
     port = server.server_address[1]
     env = run(_pipeline(settings, FetchOptions(url=f"http://echo.test:{port}/html/errors/javascript_disabled.html")))
     assert env["ok"] is False and env["outcome"] == "js_required"
+
+
+def test_golem_accept_endpoint(server, settings, monkeypatch):
+    """Without a valid preset, the consent page's own accept call is made, then the page."""
+    port = server.server_address[1]
+    monkeypatch.setattr(gates.GolemConsent, "preset", lambda self, host: {})
+    res = run(_fetch(settings, f"http://www.golem.de:{port}/"))
+    assert res.status == 200 and b"IT-News" in res.body
+    calls = [h.url for h in res.hops if "setconsentcookie.php" in h.url]
+    assert calls and "type=cmp" in calls[0] and "version=%7C261101" in calls[0]

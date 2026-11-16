@@ -20,7 +20,7 @@ import datetime as _dt
 import re
 import uuid
 from dataclasses import dataclass, field
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 
 @dataclass
@@ -40,6 +40,9 @@ class GateAction:
     event: GateEvent
     cookies: dict[str, str] = field(default_factory=dict)
     cookie_domain: str = ""
+    # When set, ``url`` is an accept endpoint called for its cookies only; the fetch then
+    # continues at ``then_url`` (the page the visitor originally asked for).
+    then_url: str | None = None
 
 
 def _host(url: str) -> str:
@@ -207,45 +210,50 @@ class DerStandardConsent(CookieRetryRecipe):
 
 
 class GolemConsent(CookieRetryRecipe):
-    """golem.de redirects to /sonstiges/zustimmung/auswahl.html?from=<url>. Accepting sets
-    ``golem_consent20=cmp|<policy version>``. The version changes when the policy does,
-    so the consent page is read for the current one, as clicking accept would use it."""
+    """golem.de redirects to /sonstiges/zustimmung/auswahl.html?from=<url>. Its accept
+    button calls ``<cookieUrl>/setconsentcookie.php?type=cmp&version=<cookieVersion>&...``,
+    which sets ``golem_consent20=cmp<cookieVersion>``. We read cookieUrl, cookieVersion
+    and cookieExpire from the consent page's own config and make that same call."""
 
     name = "golem"
     domains = ("golem.de",)
     gate_path = re.compile(r"^/sonstiges/zustimmung/")
     return_param = "from"
     detail = "consent page: set the golem_consent20 cookie that accepting sets"
-    FALLBACK = "cmp|261101"
-    # The consent page configures its script with e.g. {"cookieVersion":"|261101", ...}.
-    _VERSION = re.compile(r"""["']cookieVersion["']\s*:\s*["'](\|?\d{4,8})["']""")
-    _CMP = re.compile(r"""["'](cmp\|\d{6})["']""")
+    FALLBACK_VERSION = "|261101"
+    _VERSION = re.compile(r"""["']?cookieVersion["']?\s*:\s*["'](\|?\d{3,8})["']""")
+    _EXPIRE = re.compile(r"""["']?cookieExpire["']?\s*:\s*(\d{1,4})""")
+    _URL = re.compile(r"""["']?cookieUrl["']?\s*:\s*["'](https?://[^"']+)["']""")
 
     def __init__(self):
-        self.version = self.FALLBACK
+        self.version = self.FALLBACK_VERSION
 
     def cookies(self):
-        return {"golem_consent20": self.version}
+        return {"golem_consent20": "cmp" + self.version}
 
     def on_response(self, *, original_url, url, status, location, head):
         here = urlsplit(url)
-        if status == 200 and self.applies(_host(url)) and self.gate_path.search(here.path):
-            m = self._VERSION.search(head)
-            if m:
-                self.version = "cmp" + (m.group(1) if m.group(1).startswith("|") else "|" + m.group(1))
-            else:
-                m = self._CMP.search(head)
-                if m:
-                    self.version = m.group(1)
-            back = (parse_qs(here.query).get(self.return_param) or [original_url])[0]
-            return GateAction(
-                url=back if back.startswith(("http://", "https://")) else original_url,
-                cookies=self.cookies(),
-                cookie_domain="." + (self.applies(_host(url)) or "golem.de"),
-                event=GateEvent(self.name, self.kind, "page",
-                                f"consent page: set golem_consent20={self.version}, as accepting does"),
-            )
-        return None
+        if status != 200 or not self.applies(_host(url)) or not self.gate_path.search(here.path):
+            return None
+        versions = [v for v in self._VERSION.findall(head) if v.strip("|0")]  # skip the "|000" default
+        if versions:
+            self.version = versions[-1] if versions[-1].startswith("|") else "|" + versions[-1]
+        expire = (self._EXPIRE.findall(head) or ["90"])[-1]
+        base = (self._URL.findall(head) or ["https://www.golem.de/abo"])[-1].rstrip("/")
+        back = (parse_qs(here.query).get(self.return_param) or [original_url])[0]
+        if not back.startswith(("http://", "https://")):
+            back = original_url
+        accept = (f"{base}/setconsentcookie.php?type=cmp&version={quote(self.version, safe='')}"
+                  f"&expire={expire}&referer={quote(back, safe='')}")
+        return GateAction(
+            url=accept,
+            then_url=back,
+            cookies=self.cookies(),
+            cookie_domain="." + (self.applies(_host(url)) or "golem.de"),
+            event=GateEvent(self.name, self.kind, "page",
+                            f"consent page: called setconsentcookie.php (version {self.version}), "
+                            "the request its accept button makes"),
+        )
 
 
 class GoogleConsent(Recipe):

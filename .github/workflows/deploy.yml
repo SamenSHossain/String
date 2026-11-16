@@ -43,9 +43,6 @@ jobs:
             "https://www.nu.nl/" "https://tweakers.net/" "https://www.volkskrant.nl/" "https://www.ad.nl/" \
             "https://www.zeit.de/index" "https://www.derstandard.at/" "https://www.golem.de/" \
             "https://www.southwest.com/" "https://www.sahibinden.com/" "https://www.ozon.ru/"
-      - name: Raw dumps for recipe debugging
-        run: |
-          python -m webfetch.cli --raw 200 --grep "cookieDateName|cookieVersion|getTime|toISOString|Date\(|setCookie|document\.cookie" "https://www.golem.de/staticrl/scripts/golem_consent_200-min.js"
       - name: Same targets with gate recipes disabled (what a generic fetcher sees)
         run: |
           python -m webfetch.cli --no-gates --markdown 160 \

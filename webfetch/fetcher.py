@@ -158,6 +158,7 @@ class HttpFetcher:
             current = target.url
             redirects = gate_actions = meta_refreshes = 0
             resolve_ms = 0.0
+            then_url: str | None = None
             while True:
                 try:
                     hop_target = normalize_url(current)
@@ -203,6 +204,11 @@ class HttpFetcher:
                 location = resp.headers.get("location") if status in _REDIRECT else None
                 hops.append(Hop(current, status, location, hop_ms, remote_ip))
 
+                if then_url is not None:
+                    # That hop was a consent "accept" call made for its cookies only.
+                    current, then_url = then_url, None
+                    continue
+
                 if resolve_gates and gate_actions < MAX_GATE_ACTIONS:
                     head = resp.content[:262144].decode("utf-8", "replace")
                     action = check_response(original_url=target.url, url=current, status=status,
@@ -213,6 +219,7 @@ class HttpFetcher:
                         gates.append(action.event)
                         gate_actions += 1
                         current = action.url
+                        then_url = action.then_url
                         continue
 
                 if location:

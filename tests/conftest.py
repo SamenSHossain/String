@@ -102,6 +102,21 @@ class Handler(BaseHTTPRequestHandler):
             cb = quote(f"http://www.nu.nl:{port}/privacy-gate/accept?redirectUri={quote(path, safe='')}", safe="")
             return self._send(302, headers={"Location": f"https://myprivacy.dpgmedia.nl/consent?siteKey=abc&callbackUrl={cb}&isLoggedIn=false"})
 
+        if host == "www.golem.de":
+            if path == "/abo/setconsentcookie.php":
+                ok = qs.get("type") == ["cmp"] and qs.get("version") == ["|261101"]
+                return self._send(200, "ok", cookies=["golem_consent20=cmp|261101; Path=/; Domain=golem.de"] if ok else [])
+            if path.startswith("/sonstiges/zustimmung/"):
+                return self._send(200, '<html><head><title>Golem</title></head><body><h1>Cookies zustimmen</h1>'
+                                       '<script>GolemConsent.setCustomConfig({"cookieName":"golem_consent20",'
+                                       '"cookieExpire":90,"cookieVersion":"|261101","cookieUrl":"http://www.golem.de:'
+                                       + str(port) + '/abo"});</script></body></html>')
+            if cookies.get("golem_consent20") == "cmp|261101":
+                return self._send(200, "<html><head><title>Golem.de: IT-News</title></head><body><p>"
+                                       + "IT-News für Profis. " * 40 + "</p></body></html>")
+            back = quote(f"http://www.golem.de:{port}{path}", safe="")
+            return self._send(302, headers={"Location": f"/sonstiges/zustimmung/auswahl.html?from={back}"})
+
         if host == "www.zeit.de":
             if path.startswith("/zustimmung"):
                 return self._send(200, "<html><head><title>Zustimmung</title></head><body>Bitte zustimmen</body></html>")
