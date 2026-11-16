@@ -37,7 +37,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Fetch the gated targets (gates resolved)
         run: |
-          python -m webfetch.cli --markdown 240 \
+          python -m webfetch.cli --compact \
             "https://store.steampowered.com/app/271590/Grand_Theft_Auto_V_Legacy/" \
             "https://store.steampowered.com/app/1091500/Cyberpunk_2077/" \
             "https://www.nu.nl/" "https://tweakers.net/" "https://www.volkskrant.nl/" "https://www.ad.nl/" \
@@ -45,7 +45,7 @@ jobs:
             "https://www.southwest.com/" "https://www.sahibinden.com/" "https://www.ozon.ru/"
       - name: Same targets with gate recipes disabled (what a generic fetcher sees)
         run: |
-          python -m webfetch.cli --no-gates --markdown 160 \
+          python -m webfetch.cli --compact --no-gates \
             "https://store.steampowered.com/app/271590/Grand_Theft_Auto_V_Legacy/" \
             "https://www.nu.nl/" "https://www.zeit.de/index" "https://www.derstandard.at/" "https://www.golem.de/"
 

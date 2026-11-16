@@ -73,6 +73,13 @@ async def main_async(args) -> None:
                                            "bytes", "visibleChars", "timing", "extracted")}
             out["title"] = meta.get("title")
             out["markdownHead"] = " ".join(md.split())[: args.markdown]
+            if args.compact:
+                ex = (out.get("extracted") or {}).get("data")
+                print(f"{'OK  ' if out['ok'] else 'FAIL'} {out['outcome']:<13} {out['statusCode']} "
+                      f"{out['timing'].get('totalMs', 0):>7.0f}ms gates={[g['site'] + ':' + g['trigger'] for g in out['gates'] or []]} "
+                      f"title={(out['title'] or '')[:60]!r} url={url}" + (f" extracted={json.dumps(ex, ensure_ascii=False)[:300]}" if ex else ""),
+                      flush=True)
+                continue
             print(json.dumps(out, ensure_ascii=False), flush=True)
     finally:
         await fetcher.aclose()
@@ -86,6 +93,7 @@ def main() -> None:
     ap.add_argument("--no-gates", action="store_true", help="disable gate recipes (to see the raw wall)")
     ap.add_argument("--raw", type=int, default=0, help="print status, headers and N chars of the raw body")
     ap.add_argument("--grep", help="with --raw: print context around matches of this regex")
+    ap.add_argument("--compact", action="store_true", help="one short line per URL")
     asyncio.run(main_async(ap.parse_args()))
 
 
