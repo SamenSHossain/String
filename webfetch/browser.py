@@ -15,6 +15,12 @@ from urllib.parse import urlsplit
 
 from .netguard import host_is_blocked, ip_is_public
 
+# DOM markers of interstitials that finish by reloading the page. DOM-only on purpose:
+# patchright evaluates in an isolated world where page globals are not visible.
+CHALLENGE_DOM = """() => !!document.querySelector(
+  'script[src*="centinelanalytica.com"], #challenge-form, #challenge-running, #challenge-stage,'
+  + ' #sec-if-cpt-container, #sec-cpt-if, iframe[src*="captcha-delivery.com"], #px-captcha')"""
+QUIET_SECONDS = 2.5
 CHALLENGE_TITLES = ("just a moment", "attention required", "please wait", "checking your browser",
                     "one moment", "verifying you are human", "pardon our interruption")
 BLOCKED_RESOURCES = {"image", "media", "font"}
@@ -38,11 +44,13 @@ async def _host_is_public(host: str, cache: dict[str, bool]) -> bool:
 
 
 class BrowserPool:
-    def __init__(self) -> None:
+    def __init__(self, *, allow_private: bool = False, executable_path: str | None = None) -> None:
         self._pw = None
         self._browser = None
         self.engine = "playwright"
         self._lock = asyncio.Lock()
+        self.allow_private = allow_private  # tests only
+        self.executable_path = executable_path
 
     async def start(self) -> None:
         async with self._lock:
@@ -56,8 +64,9 @@ class BrowserPool:
                 self.engine = "playwright"
             if self._pw is None:
                 self._pw = await async_playwright().start()
+            launch_kw = {"executable_path": self.executable_path} if self.executable_path else {"channel": "chromium"}
             self._browser = await self._pw.chromium.launch(
-                channel="chromium",
+                **launch_kw,
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled",
                       "--lang=en-US"],
@@ -89,6 +98,8 @@ class BrowserPool:
                 req = route.request
                 if req.resource_type in BLOCKED_RESOURCES:
                     return await route.abort()
+                if self.allow_private:
+                    return await route.continue_()
                 host = urlsplit(req.url).hostname or ""
                 if req.is_navigation_request():
                     if not await _host_is_public(host, dns_cache):
@@ -103,18 +114,42 @@ class BrowserPool:
                 await route.continue_()
 
             await page.route("**/*", guard)
+            nav = {"t": time.monotonic(), "resp": None}
+
+            def on_nav(frame):
+                if frame == page.main_frame:
+                    nav["t"] = time.monotonic()
+
+            def on_resp(r):
+                try:
+                    if r.request.is_navigation_request() and r.frame == page.main_frame:
+                        nav["resp"] = r
+                except Exception:
+                    pass
+
+            page.on("framenavigated", on_nav)
+            page.on("response", on_resp)
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=max(1.0, timeout - 2) * 1000)
             try:
                 left = (deadline - time.monotonic()) * 1000
                 await page.wait_for_load_state("networkidle", timeout=max(500, min(6000, left - 2000)))
             except Exception:
                 pass
-            # Give interstitial JS challenges a chance to complete and navigate.
-            while time.monotonic() < deadline - 2:
-                title = (await page.title()).lower()
-                if not any(t in title for t in CHALLENGE_TITLES):
+            # Interstitial challenges (Cloudflare, Akamai, Centinel, ...) run their script and
+            # then reload the page: wait until the main frame has been quiet and no challenge
+            # marker is left, or the deadline is near.
+            while time.monotonic() < deadline - 1.5:
+                try:
+                    title = (await page.title()).lower()
+                    challenged = any(t in title for t in CHALLENGE_TITLES) or await page.evaluate(CHALLENGE_DOM)
+                except Exception:  # page navigating mid-check
+                    challenged = True
+                if not challenged and time.monotonic() - nav["t"] >= QUIET_SECONDS:
                     break
-                await page.wait_for_timeout(1000)
+                if not challenged and nav["resp"] is not None and nav["resp"].status < 400:
+                    break
+                await page.wait_for_timeout(500)
+            resp = nav["resp"] or resp
             html = await page.content()
             status = resp.status if resp is not None else 0
             hdrs = await resp.all_headers() if resp is not None else {}

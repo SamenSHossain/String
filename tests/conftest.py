@@ -110,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
             back = quote(f"http://www.zeit.de:{port}{path}", safe="")
             return self._send(302, headers={"Location": f"/zustimmung?url={back}"})
 
-        if host == "echo.test":
+        if host in ("echo.test", "127.0.0.1"):
             if path == "/set":
                 return self._send(200, "<html><body>set</body></html>", cookies=["sess=secret123; Path=/"])
             if path == "/cookies":
@@ -130,6 +130,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(302, headers={"Location": "http://10.0.0.1/admin"})
             if path == "/product":
                 return self._send(200, PRODUCT_PAGE)
+            if path == "/js-challenge":
+                if cookies.get("passed") == "1":
+                    return self._send(200, "<html><head><title>Real page</title></head><body><h1>Real content</h1><p>"
+                                           + "Behind the challenge. " * 30 + "</p></body></html>")
+                return self._send(403, '<html><head><title>Example News</title></head><body><div id="challenge-running">'
+                                       '</div><script>document.cookie="passed=1; path=/";'
+                                       'setTimeout(function(){location.reload()}, 600);</script></body></html>')
+            if path == "/spa":
+                return self._send(200, '<html><head><title>App</title></head><body><div id="root"></div><script>'
+                                       'document.getElementById("root").innerHTML="<h1>Rendered by JavaScript</h1>"'
+                                       '</script></body></html>')
             if path == "/noscript-refresh":
                 return self._send(200, '<html><head><noscript><meta http-equiv="refresh" '
                                        'content="0;url=/html/errors/javascript_disabled.html"></noscript>'

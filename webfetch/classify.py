@@ -39,6 +39,7 @@ _STRONG = [
     ("sucuri", "challenge", re.compile(r"sucuri website firewall|sucuri_cloudproxy_js")),
     ("ddos-guard", "challenge", re.compile(r"check\.ddos-guard\.net|<title>\s*ddos-guard\s*</title>")),
     ("ozon", "blocked", re.compile(r"abt-challenge")),
+    ("centinel", "challenge", re.compile(r"centinelanalytica\.com|window\.__centinel")),
 ]
 _WEAK = [
     ("cloudflare", "challenge", re.compile(r"/cdn-cgi/challenge-platform/|challenges\.cloudflare\.com/turnstile")),

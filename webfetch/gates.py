@@ -216,9 +216,10 @@ class GolemConsent(CookieRetryRecipe):
     gate_path = re.compile(r"^/sonstiges/zustimmung/")
     return_param = "from"
     detail = "consent page: set the golem_consent20 cookie that accepting sets"
-    FALLBACK = "cmp|250101"
-    _VERSION = re.compile(r"golem_consent20\s*[=:,]\s*['\"]?\s*(cmp(?:\||%7C)\d{6})", re.I)
-    _CMP = re.compile(r"['\"](cmp\|\d{6})['\"]")
+    FALLBACK = "cmp|261101"
+    # The consent page configures its script with e.g. {"cookieVersion":"|261101", ...}.
+    _VERSION = re.compile(r"""["']cookieVersion["']\s*:\s*["'](\|?\d{4,8})["']""")
+    _CMP = re.compile(r"""["'](cmp\|\d{6})["']""")
 
     def __init__(self):
         self.version = self.FALLBACK
@@ -229,9 +230,13 @@ class GolemConsent(CookieRetryRecipe):
     def on_response(self, *, original_url, url, status, location, head):
         here = urlsplit(url)
         if status == 200 and self.applies(_host(url)) and self.gate_path.search(here.path):
-            m = self._VERSION.search(head) or self._CMP.search(head)
+            m = self._VERSION.search(head)
             if m:
-                self.version = m.group(1).replace("%7C", "|").replace("%7c", "|")
+                self.version = "cmp" + (m.group(1) if m.group(1).startswith("|") else "|" + m.group(1))
+            else:
+                m = self._CMP.search(head)
+                if m:
+                    self.version = m.group(1)
             back = (parse_qs(here.query).get(self.return_param) or [original_url])[0]
             return GateAction(
                 url=back if back.startswith(("http://", "https://")) else original_url,
