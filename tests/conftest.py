@@ -23,8 +23,11 @@ STEAM_PAGE = """<!DOCTYPE html><html lang="en"><head><title>Grand Theft Auto V L
 </head><body>
 <div class="apphub_AppName" id="appHubAppName">Grand Theft Auto V Legacy</div>
 <div class="game_description_snippet">Grand Theft Auto V for PC offers players the option to explore the award-winning world of Los Santos.</div>
-<div class="user_reviews_summary_row" data-tooltip-html="87% of the 1,734,567 user reviews for this game are positive.">
-<span class="game_review_summary positive">Very Positive</span></div>
+<a class="user_reviews_summary_row" href="#app_reviews_hash" data-tooltip-html="81% of the 5,010 user reviews in the last 30 days are positive.">
+<div class="subtitle column">Recent Reviews:</div><div class="summary column"><span class="game_review_summary positive">Very Positive</span></div></a>
+<a class="user_reviews_summary_row" href="#app_reviews_hash" data-tooltip-html="87% of the 1,734,567 user reviews in your language are positive" itemprop="aggregateRating" itemscope itemtype="http://schema.org/AggregateRating">
+<div class="subtitle column all"> English Reviews: </div><div class="summary column"><span class="game_review_summary positive" itemprop="description">Mostly Positive</span>
+<meta itemprop="reviewCount" content="1734567"><meta itemprop="ratingValue" content="9"></div></a>
 <div class="release_date"><div class="subtitle">Release Date:</div><div class="date">13 Apr, 2015</div></div>
 <div class="dev_row"><div class="subtitle">Developer:</div><div class="summary" id="developers_list"><a href="/dev/rockstar">Rockstar North</a></div></div>
 <div class="dev_row"><div class="subtitle">Publisher:</div><div class="summary"><a href="/pub/rockstar">Rockstar Games</a></div></div>

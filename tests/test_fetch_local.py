@@ -192,7 +192,7 @@ def test_steam_schema_uses_site_extractor(server, settings):
     assert d["releaseDate"] == "2015-04-13"
     assert d["developer"] == "Rockstar North" and d["publisher"] == "Rockstar Games"
     assert d["tags"] == ["Open World", "Action"]
-    assert d["reviewSummary"] == "Very Positive" and d["reviewCount"] == 1734567
+    assert d["reviewSummary"] == "Mostly Positive" and d["reviewCount"] == 1734567  # overall row, not "Recent"
 
 
 def test_timing_breakdown_present(server, settings):
