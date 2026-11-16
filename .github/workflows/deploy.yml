@@ -76,12 +76,22 @@ jobs:
       - name: Deploy API
         if: steps.creds.outputs.present == 'true'
         shell: bash
-        run: modal deploy modal_app.py 2>&1 | tee deploy.log
+        run: |
+          # Secrets pasted into the GitHub UI often carry stray whitespace.
+          export MODAL_TOKEN_ID="$(printf '%s' "$MODAL_TOKEN_ID" | tr -d '[:space:]')"
+          export MODAL_TOKEN_SECRET="$(printf '%s' "$MODAL_TOKEN_SECRET" | tr -d '[:space:]')"
+          echo "::add-mask::$MODAL_TOKEN_SECRET"
+          echo "token id prefix: ${MODAL_TOKEN_ID:0:3}, secret prefix: ${MODAL_TOKEN_SECRET:0:3}, secret length: ${#MODAL_TOKEN_SECRET}"
+          modal deploy modal_app.py 2>&1 | tee deploy.log
       - name: Deploy headless-browser tier
         if: steps.creds.outputs.present == 'true'
         continue-on-error: true
         shell: bash
-        run: modal deploy modal_browser.py 2>&1 | tee deploy-browser.log
+        run: |
+          export MODAL_TOKEN_ID="$(printf '%s' "$MODAL_TOKEN_ID" | tr -d '[:space:]')"
+          export MODAL_TOKEN_SECRET="$(printf '%s' "$MODAL_TOKEN_SECRET" | tr -d '[:space:]')"
+          echo "::add-mask::$MODAL_TOKEN_SECRET"
+          modal deploy modal_browser.py 2>&1 | tee deploy-browser.log
       - name: Smoke test the deployed endpoint
         if: steps.creds.outputs.present == 'true'
         shell: bash
