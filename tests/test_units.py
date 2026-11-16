@@ -107,6 +107,7 @@ def test_markdown_absolute_links():
 @pytest.mark.parametrize("raw,num", [
     ("$29.98", 29.98), ("29,98€", 29.98), ("1.299,00 €", 1299.0), ("1,299.00", 1299.0), ("¥ 4,620", 4620.0),
     ("Free To Play", 0.0), (12, 12.0), ("abc", None), ("CDN$ 1 234,50", 1234.5),
+    ("39.99 29.99", 39.99), ("Was $39.99, now $29.99", 39.99), ("2 for 5", 2.0), ("12 345 678", 12345678.0),
 ])
 def test_parse_number(raw, num):
     assert parse_number(raw) == num
@@ -128,3 +129,19 @@ def test_markdown_drops_inline_data_images():
     html = '<p>Hi <img alt="Logo" src="data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="> <img alt="p" src="/a.jpg"></p>'
     md = extract.to_markdown(html, "https://ex.test/")
     assert "base64" not in md and "Logo" in md and "![p](https://ex.test/a.jpg)" in md
+
+
+def test_non_ascii_urls_are_percent_encoded():
+    assert normalize_url("https://example.com/\u00fcn\u00efcode/p\u00e4th?q=\u00e9").url == \
+        "https://example.com/%C3%BCn%C3%AFcode/p%C3%A4th?q=%C3%A9"
+    assert normalize_url("https://example.com/a%20b?x=%2F").url == "https://example.com/a%20b?x=%2F"
+
+
+def test_microdata_walk_is_linear():
+    import time
+    inner = "".join(f"<div><p><span>t{i}</span><em>x</em></p></div>" for i in range(20000))
+    html = f"<html><body><div itemscope itemtype='https://schema.org/Thing'><span itemprop='name'>N</span>{inner}</div></body></html>"
+    t = time.perf_counter()
+    items = extract.microdata(extract.parse(html), "https://x/")
+    assert items[0]["name"] == "N"
+    assert time.perf_counter() - t < 2.0

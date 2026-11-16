@@ -12,7 +12,7 @@ import asyncio
 import ipaddress
 import socket
 from dataclasses import dataclass
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 MAX_URL_LENGTH = 8192
 BLOCKED_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".intranet")
@@ -78,9 +78,20 @@ def normalize_url(raw: str) -> Target:
     netloc_host = f"[{host}]" if ":" in host else host
     default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
     netloc = netloc_host if default_port else f"{netloc_host}:{port}"
-    path = parts.path or "/"
-    canonical = urlunsplit((scheme, netloc, path, parts.query, ""))
+    path = _requote(parts.path or "/")
+    canonical = urlunsplit((scheme, netloc, path, _requote(parts.query), ""))
     return Target(url=canonical, scheme=scheme, host=host, port=port)
+
+
+_SAFE = "!#$%&'()*+,/:;=?@[]~-._"
+
+
+def _requote(component: str) -> str:
+    """Percent-encode anything outside printable ASCII (e.g. a raw UTF-8 redirect target),
+    leaving existing %XX escapes and reserved characters alone."""
+    if all(0x20 < ord(c) < 0x7F for c in component):
+        return component
+    return quote(component, safe=_SAFE)
 
 
 def ip_is_public(ip: str) -> bool:

@@ -257,7 +257,7 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
         if "statusCode" in env:
             hdrs["x-status-code"] = str(env["statusCode"])
         if env.get("finalUrl"):
-            hdrs["x-final-url"] = env["finalUrl"]
+            hdrs["x-final-url"] = env["finalUrl"].encode("ascii", "backslashreplace").decode("ascii")
         if env.get("strategy"):
             hdrs["x-strategy"] = env["strategy"]
         if env.get("gates"):

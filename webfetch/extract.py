@@ -156,10 +156,11 @@ def _microdata_item(scope, base_url: str, depth: int = 0) -> dict:
         item["@type"] = itemtype.rstrip("/").split("/")[-1]
     if depth > 6:
         return item
-    # Walk descendants, skipping those that belong to a nested itemscope.
-    stack = list(_children(scope))
+    # Walk descendants in document order, skipping those that belong to a nested itemscope.
+    # A LIFO stack with children pushed in reverse keeps this O(n) (no pop(0)/prepend).
+    stack = list(_children(scope))[::-1]
     while stack:
-        node = stack.pop(0)
+        node = stack.pop()
         attrs = node.attributes
         props = (attrs.get("itemprop") or "").split()
         if props:
@@ -175,7 +176,7 @@ def _microdata_item(scope, base_url: str, depth: int = 0) -> dict:
                 else:
                     item[p] = value
         if "itemscope" not in attrs:
-            stack[0:0] = list(_children(node))
+            stack.extend(list(_children(node))[::-1])
     return item
 
 

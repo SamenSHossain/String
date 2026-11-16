@@ -108,3 +108,10 @@ def test_rate_limit_uses_rightmost_forwarded_for():
         a = c.post("/v1/fetch", json={"url": "ftp://x"}, headers={"x-forwarded-for": "1.1.1.1, 9.9.9.9"})
         b = c.post("/v1/fetch", json={"url": "ftp://x"}, headers={"x-forwarded-for": "2.2.2.2, 9.9.9.9"})
     assert a.status_code == 400 and b.status_code == 429  # spoofed left entry does not help
+
+
+def test_raw_utf8_location_does_not_500(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/utf8-redirect", "format": "markdown"})
+    assert r.status_code == 200, r.text
+    assert r.headers["x-final-url"].endswith("/caf%C3%A9-r%C3%A9sum%C3%A9")

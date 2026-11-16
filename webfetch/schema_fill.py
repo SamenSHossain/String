@@ -184,7 +184,9 @@ def build_candidates(
 
 # --------------------------------------------------------------------------- coercion
 
-_NUM_RE = re.compile(r"[-+]?\d[\d.,'   ]*")
+# A number with optional thousands groups (".", ",", "'", or a space only when followed by
+# exactly three digits) and an optional decimal part. "39.99 29.99" is two numbers.
+_NUM_RE = re.compile(r"[-+]?\d{1,3}(?:(?:[.,']|[ \u00a0\u202f](?=\d{3}(?!\d)))\d{3})+(?:[.,]\d+)?|[-+]?\d+(?:[.,]\d+)?")
 _DATE_FORMATS = ("%Y-%m-%d", "%d %b, %Y", "%b %d, %Y", "%d %B, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y",
                  "%b %Y", "%B %Y", "%d.%m.%Y", "%m/%d/%Y")
 _IN_STOCK = ("instock", "limitedavailability", "onlineonly", "instoreonly", "preorder", "presale", "backorder")

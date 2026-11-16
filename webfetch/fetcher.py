@@ -165,6 +165,7 @@ class HttpFetcher:
                     hop_target = normalize_url(current)
                 except InvalidUrl as exc:
                     raise FetchError("invalid_redirect", f"redirected to an invalid URL: {exc}", hops=hops, gates=gates) from exc
+                current = hop_target.url
                 curl_options: dict = {CurlOpt.MAXFILESIZE_LARGE: max_bytes}
                 if s.proxy is None:
                     t_dns = time.monotonic()

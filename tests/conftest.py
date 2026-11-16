@@ -148,6 +148,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(302, headers={"Location": "http://10.0.0.1/admin"})
             if path == "/product":
                 return self._send(200, PRODUCT_PAGE)
+            if path == "/utf8-redirect":
+                self.send_response(302)
+                self.send_header("Location", "/caf\u00e9-r\u00e9sum\u00e9".encode("utf-8").decode("latin-1"))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if path.startswith("/caf"):
+                return self._send(200, "<html><body><p>" + "Caf\u00e9 page. " * 40 + "</p></body></html>")
             if path == "/gzip-bomb":
                 import gzip as _gz
                 bomb = _gz.compress(b"<html><body>" + b"0" * (20 * 1024 * 1024) + b"</body></html>", compresslevel=9)
