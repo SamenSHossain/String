@@ -130,6 +130,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(302, headers={"Location": "http://10.0.0.1/admin"})
             if path == "/product":
                 return self._send(200, PRODUCT_PAGE)
+            if path == "/noscript-refresh":
+                return self._send(200, '<html><head><noscript><meta http-equiv="refresh" '
+                                       'content="0;url=/html/errors/javascript_disabled.html"></noscript>'
+                                       '<script src="/a.js"></script><script src="/b.js"></script><script>boot()</script>'
+                                       '</head><body><div id="app"></div></body></html>')
+            if path == "/html/errors/javascript_disabled.html":
+                return self._send(200, "<html><head><title>JavaScript Required - Example</title></head><body><h1>Oops! "
+                                       "JavaScript Required.</h1><p>" + "Please enable JavaScript. " * 20 + "</p></body></html>")
 
         self._send(404, "<html><body>not found</body></html>")
 

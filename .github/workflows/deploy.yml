@@ -43,6 +43,12 @@ jobs:
             "https://www.nu.nl/" "https://tweakers.net/" "https://www.volkskrant.nl/" "https://www.ad.nl/" \
             "https://www.zeit.de/index" "https://www.derstandard.at/" "https://www.golem.de/" \
             "https://www.southwest.com/" "https://www.sahibinden.com/" "https://www.ozon.ru/"
+      - name: Raw dumps for recipe debugging
+        run: |
+          python -m webfetch.cli --raw 1500 "https://www.zeit.de/index" "https://www.zeit.de/"
+          python -m webfetch.cli --no-gates --raw 300 --grep "golem_consent|cmp\||document\.cookie|cookie=|zustimm" "https://www.golem.de/"
+          python -m webfetch.cli --raw 2500 "https://www.southwest.com/"
+          python -m webfetch.cli --raw 50 --grep "data-price-final|game_purchase_price|discount_final_price|priceCurrency|not available" "https://store.steampowered.com/app/271590/Grand_Theft_Auto_V_Legacy/"
       - name: Same targets with gate recipes disabled (what a generic fetcher sees)
         run: |
           python -m webfetch.cli --no-gates --markdown 160 \

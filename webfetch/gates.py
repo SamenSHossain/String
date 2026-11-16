@@ -207,14 +207,40 @@ class DerStandardConsent(CookieRetryRecipe):
 
 
 class GolemConsent(CookieRetryRecipe):
+    """golem.de redirects to /sonstiges/zustimmung/auswahl.html?from=<url>. Accepting sets
+    ``golem_consent20=cmp|<policy version>``. The version changes when the policy does,
+    so the consent page is read for the current one, as clicking accept would use it."""
+
     name = "golem"
     domains = ("golem.de",)
     gate_path = re.compile(r"^/sonstiges/zustimmung/")
     return_param = "from"
     detail = "consent page: set the golem_consent20 cookie that accepting sets"
+    FALLBACK = "cmp|250101"
+    _VERSION = re.compile(r"golem_consent20\s*[=:,]\s*['\"]?\s*(cmp(?:\||%7C)\d{6})", re.I)
+    _CMP = re.compile(r"['\"](cmp\|\d{6})['\"]")
+
+    def __init__(self):
+        self.version = self.FALLBACK
 
     def cookies(self):
-        return {"golem_consent20": "cmp|" + _dt.date.today().strftime("%y%m%d")}
+        return {"golem_consent20": self.version}
+
+    def on_response(self, *, original_url, url, status, location, head):
+        here = urlsplit(url)
+        if status == 200 and self.applies(_host(url)) and self.gate_path.search(here.path):
+            m = self._VERSION.search(head) or self._CMP.search(head)
+            if m:
+                self.version = m.group(1).replace("%7C", "|").replace("%7c", "|")
+            back = (parse_qs(here.query).get(self.return_param) or [original_url])[0]
+            return GateAction(
+                url=back if back.startswith(("http://", "https://")) else original_url,
+                cookies=self.cookies(),
+                cookie_domain="." + (self.applies(_host(url)) or "golem.de"),
+                event=GateEvent(self.name, self.kind, "page",
+                                f"consent page: set golem_consent20={self.version}, as accepting does"),
+            )
+        return None
 
 
 class GoogleConsent(Recipe):

@@ -24,6 +24,7 @@ _META_REFRESH = re.compile(
     rb"""<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["']?\s*(\d+)\s*[;,]\s*url\s*=\s*['"]?([^"'>\s]+)""",
     re.I,
 )
+_NOSCRIPT = re.compile(rb"<noscript\b.*?</noscript\s*>", re.I | re.S)
 _HTTP_VERSIONS = {1: "1.0", 2: "1.1", 3: "2", 4: "2", 5: "2", 30: "3", 31: "3"}
 _INFOS = [CurlInfo.NAMELOOKUP_TIME, CurlInfo.CONNECT_TIME, CurlInfo.APPCONNECT_TIME,
           CurlInfo.STARTTRANSFER_TIME, CurlInfo.TOTAL_TIME]
@@ -203,7 +204,7 @@ class HttpFetcher:
                 hops.append(Hop(current, status, location, hop_ms, remote_ip))
 
                 if resolve_gates and gate_actions < MAX_GATE_ACTIONS:
-                    head = resp.content[:16384].decode("latin-1", "replace")
+                    head = resp.content[:262144].decode("utf-8", "replace")
                     action = check_response(original_url=target.url, url=current, status=status,
                                             location=location, head=head)
                     if action is not None:
@@ -222,7 +223,9 @@ class HttpFetcher:
                     continue
 
                 if status == 200 and len(resp.content) < 16384 and meta_refreshes < MAX_META_REFRESH:
-                    m = _META_REFRESH.search(resp.content)
+                    # A refresh inside <noscript> only fires for browsers with JavaScript off;
+                    # following it lands on "JavaScript required" pages a real visitor never sees.
+                    m = _META_REFRESH.search(_NOSCRIPT.sub(b"", resp.content))
                     if m and int(m.group(1)) <= 5:
                         meta_refreshes += 1
                         current = urljoin(current, _html.unescape(m.group(2).decode("latin-1")))

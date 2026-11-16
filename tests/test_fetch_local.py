@@ -202,3 +202,16 @@ def test_timing_breakdown_present(server, settings):
     for key in ("dnsMs", "connectMs", "ttfbMs", "fetchMs", "processMs", "totalMs"):
         assert key in t
     assert env["redirects"]  # the privacy-gate detour is visible
+
+
+def test_noscript_refresh_not_followed(server, settings):
+    port = server.server_address[1]
+    env = run(_pipeline(settings, FetchOptions(url=f"http://echo.test:{port}/noscript-refresh")))
+    assert env["finalUrl"].endswith("/noscript-refresh")
+    assert env["ok"] is False and env["outcome"] == "js_required"
+
+
+def test_js_required_page_is_flagged(server, settings):
+    port = server.server_address[1]
+    env = run(_pipeline(settings, FetchOptions(url=f"http://echo.test:{port}/html/errors/javascript_disabled.html")))
+    assert env["ok"] is False and env["outcome"] == "js_required"

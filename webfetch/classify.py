@@ -51,6 +51,7 @@ _JS_REQUIRED = re.compile(
     r"requires\s+javascript|you need to enable javascript",
     re.I,
 )
+_JS_URL = re.compile(r"(javascript[_-]?(disabled|required)|/nojs|/no-js|enable[_-]?javascript)", re.I)
 _LOGIN_PATH = re.compile(r"/(login|signin|sign-in|log-in|auth/login|accounts/login|session/new|users/sign_in)(/|$|\?|\.)", re.I)
 _CONSENT_TITLE = re.compile(r"privacy gate|cookie ?wall|cookie consent|zustimmung|toestemming|consent", re.I)
 _AGE_TITLE = re.compile(r"age (check|verification|gate)|verify your age|altersverifikation|altersprüfung", re.I)
@@ -142,6 +143,8 @@ def classify(
 
     if not body.strip():
         return Verdict("empty", f"destination answered {status} with an empty body")
+    if visible_chars < WEAK_TEXT_LIMIT and (_JS_REQUIRED.search(title) or _JS_URL.search(parts.path)):
+        return Verdict("js_required", f"'JavaScript required' page ({title[:60]!r})")
     is_html = "html" in content_type.lower() or head.lstrip().startswith(("<!doctype html", "<html"))
     if is_html and visible_chars < SHELL_TEXT_LIMIT:
         if _JS_REQUIRED.search(head) or head.count("<script") >= 3:

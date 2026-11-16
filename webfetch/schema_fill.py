@@ -482,15 +482,22 @@ def steam_extractor(tree: LexborHTMLParser, url: str) -> dict[str, tuple[Any, st
     desc = tree.css_first(".game_description_snippet")
     if _txt(desc):
         out["description"] = (_txt(desc), "steam:.game_description_snippet")
-    summary = tree.css_first(".user_reviews_summary_row .game_review_summary")
-    if _txt(summary):
-        out["reviewsummary"] = (_txt(summary), "steam:.game_review_summary")
-    for row in tree.css(".user_reviews_summary_row"):
+    rows = tree.css(".user_reviews_summary_row")
+    # Steam shows "Recent Reviews" (last 30 days) before "All Reviews"; prefer the latter.
+    def _is_all(row) -> bool:
+        tip = row.attributes.get("data-tooltip-html") or ""
+        label = _txt(row.css_first(".subtitle")).lower()
+        return "all reviews" in label or "for this game" in tip
+    ordered = sorted(rows, key=lambda r: 0 if _is_all(r) else 1)
+    for row in ordered:
+        summary = row.css_first(".game_review_summary")
         tip = row.attributes.get("data-tooltip-html") or ""
         m = re.search(r"([\d,.]+)%\s+of the\s+([\d,.]+)\s+user reviews", tip)
-        if m:
-            out["rating"] = (parse_number(m.group(1)), "steam:.user_reviews_summary_row@data-tooltip-html")
-            out["reviewcount"] = (parse_number(m.group(2)), "steam:.user_reviews_summary_row@data-tooltip-html")
+        if _txt(summary) and "reviewsummary" not in out:
+            out["reviewsummary"] = (_txt(summary), "steam:All Reviews .game_review_summary")
+        if m and "reviewcount" not in out:
+            out["rating"] = (parse_number(m.group(1)), "steam:All Reviews @data-tooltip-html")
+            out["reviewcount"] = (parse_number(m.group(2)), "steam:All Reviews @data-tooltip-html")
     img = tree.css_first("img.game_header_image_full")
     if img is not None and img.attributes.get("src"):
         out["headerimage"] = (img.attributes["src"], "steam:img.game_header_image_full")

@@ -29,8 +29,33 @@ SCHEMAS = {
 }
 
 
+async def dump_raw(fetcher: HttpFetcher, args) -> None:
+    """Print the destination's raw answer: status, headers and body head (debugging)."""
+    import re as _re
+
+    for url in args.urls:
+        try:
+            res = await fetcher.fetch(url, resolve_gates=not args.no_gates)
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"url": url, "exception": f"{type(exc).__name__}: {exc}"}), flush=True)
+            continue
+        text = res.body.decode("utf-8", "replace")
+        out = {"url": url, "status": res.status, "finalUrl": res.final_url, "headers": res.headers,
+               "hops": [h.as_dict() for h in res.hops], "bytes": len(res.body), "head": text[: args.raw]}
+        if args.grep:
+            out["grep"] = [text[max(0, m.start() - 160): m.end() + 160]
+                           for m in _re.finditer(args.grep, text, _re.I)][:12]
+        print(json.dumps(out, ensure_ascii=False), flush=True)
+
+
 async def main_async(args) -> None:
     fetcher = HttpFetcher(load_settings())
+    if args.raw:
+        try:
+            await dump_raw(fetcher, args)
+        finally:
+            await fetcher.aclose()
+        return
     try:
         for url in args.urls:
             schema = SCHEMAS.get(args.schema) if args.schema else (SCHEMAS["steam"] if "steampowered" in url else None)
@@ -59,6 +84,8 @@ def main() -> None:
     ap.add_argument("--schema", choices=sorted(SCHEMAS))
     ap.add_argument("--markdown", type=int, default=300, help="characters of Markdown to print")
     ap.add_argument("--no-gates", action="store_true", help="disable gate recipes (to see the raw wall)")
+    ap.add_argument("--raw", type=int, default=0, help="print status, headers and N chars of the raw body")
+    ap.add_argument("--grep", help="with --raw: print context around matches of this regex")
     asyncio.run(main_async(ap.parse_args()))
 
 
