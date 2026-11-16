@@ -40,7 +40,7 @@ CASES = {
 SPEED = {
     "https://en.wikipedia.org/wiki/Web_scraping": ["Web scraping"],
     "https://www.python.org/": ["Python"],
-    "https://news.ycombinator.com/": ["Hacker News"],
+    "https://news.ycombinator.com/": ["points"],
     "https://www.bbc.com/news": ["BBC"],
     "https://www.spiegel.de/": ["SPIEGEL"],
     "https://github.com/trending": ["Trending"],
@@ -81,9 +81,12 @@ def string_call(url: str, execute_js: bool) -> dict:
 def ours_call(base: str, url: str) -> dict:
     status, h, body, secs = post(base.rstrip("/") + "/v1/fetch", {"url": url, "format": "markdown"}, {})
     text = body.decode("utf-8", "replace")
+    timing = dict(p.split(";dur=") for p in (h.get("server-timing") or "").split(", ") if ";dur=" in p)
     return {"provider": "webfetch", "http": status, "secs": round(secs, 3), "destStatus": h.get("x-status-code"),
             "finalUrl": h.get("x-final-url"), "requestId": h.get("x-request-id"), "outcome": h.get("x-outcome"),
-            "gates": h.get("x-gates"), "serverTiming": h.get("server-timing"), "chars": len(text), "text": text}
+            "strategy": h.get("x-strategy"), "gates": h.get("x-gates"),
+            "serverMs": {k: float(v) for k, v in timing.items()}, "chars": len(text),
+            "base64Images": text.count(";base64,"), "text": text}
 
 
 def main() -> None:

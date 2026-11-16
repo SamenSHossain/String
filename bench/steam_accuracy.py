@@ -133,6 +133,8 @@ def main() -> None:
             env = json.loads(body or b"{}")
             got = ((env.get("extracted") or {}).get("data")) or {}
             row = {"appid": appid, "url": url, "truth": truth, "ours": got, "oursOutcome": env.get("outcome"),
+                   "oursExtractMs": (env.get("extracted") or {}).get("ms"),
+                   "oursServerMs": (env.get("timing") or {}).get("totalMs"),
                    "oursRequestId": h.get("x-request-id"), "oursSecs": round(secs, 3),
                    "oursSources": (env.get("extracted") or {}).get("sources"),
                    "gated": any(g.get("kind") == "age_gate" for g in env.get("gates") or [] if g.get("trigger") != "preset")}
