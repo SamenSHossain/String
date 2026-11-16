@@ -116,3 +116,15 @@ def test_consent_path_only_counts_after_a_detour():
     article = "<html><body>" + "An article about consent management. " * 60 + "</body></html>"
     assert _verdict(200, article, url="https://gdpr.example/consent/", final="https://gdpr.example/consent/").outcome == "ok"
     assert _verdict(200, article, url="https://news.example/", final="https://news.example/consent/").outcome == "consent_wall"
+
+
+def test_soft_rate_limit_page():
+    page = ("<html><body><table><tr><td>Hacker News</td></tr></table>"
+            "<p>Sorry, we're not able to serve your requests this quickly.</p></body></html>")
+    assert _verdict(200, page).outcome == "rate_limited"
+
+
+def test_markdown_drops_inline_data_images():
+    html = '<p>Hi <img alt="Logo" src="data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="> <img alt="p" src="/a.jpg"></p>'
+    md = extract.to_markdown(html, "https://ex.test/")
+    assert "base64" not in md and "Logo" in md and "![p](https://ex.test/a.jpg)" in md

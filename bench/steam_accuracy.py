@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import re
 import time
 import urllib.error
 import urllib.request

@@ -53,6 +53,13 @@ _JS_REQUIRED = re.compile(
     re.I,
 )
 _JS_URL = re.compile(r"(javascript[_-]?(disabled|required)|/nojs|/no-js|enable[_-]?javascript)", re.I)
+# Soft rate limits served as 200 pages (e.g. Hacker News: "Sorry, we're not able to serve
+# your requests this quickly").
+_SOFT_LIMIT = re.compile(
+    r"not able to serve your requests this quickly|too many requests|rate limit(ed)? exceeded|"
+    r"you are being rate limited|slow down, you're making too many requests",
+    re.I,
+)
 _LOGIN_PATH = re.compile(r"/(login|signin|sign-in|log-in|auth/login|accounts/login|session/new|users/sign_in)(/|$|\?|\.)", re.I)
 _CONSENT_TITLE = re.compile(r"privacy gate|cookie ?wall|cookie consent|zustimmung|toestemming|consent", re.I)
 _AGE_TITLE = re.compile(r"age (check|verification|gate)|verify your age|altersverifikation|altersprüfung", re.I)
@@ -148,6 +155,8 @@ def classify(
 
     if not body.strip():
         return Verdict("empty", f"destination answered {status} with an empty body")
+    if visible_chars < WEAK_TEXT_LIMIT and _SOFT_LIMIT.search(head):
+        return Verdict("rate_limited", "destination served a rate-limit notice")
     if visible_chars < WEAK_TEXT_LIMIT and (_JS_REQUIRED.search(title) or _JS_URL.search(parts.path)):
         return Verdict("js_required", f"'JavaScript required' page ({title[:60]!r})")
     is_html = "html" in content_type.lower() or head.lstrip().startswith(("<!doctype html", "<html"))

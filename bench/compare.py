@@ -23,14 +23,29 @@ STRING_API = "https://request.usestring.ai/v1/fetch"
 
 # url -> markers that appear only on the real page (any one suffices)
 CASES = {
-    "https://store.steampowered.com/app/271590/Grand_Theft_Auto_V_Legacy/": ["About This Game", "Rockstar North"],
-    "https://store.steampowered.com/app/1091500/Cyberpunk_2077/": ["About This Game", "CD PROJEKT RED"],
-    "https://www.nu.nl/": ["Het laatste nieuws", "Net binnen"],
-    "https://tweakers.net/": ["Nieuws", "Pricewatch"],
-    "https://www.volkskrant.nl/": ["Nieuws", "Opinie"],
-    "https://www.zeit.de/index": ["ZEIT ONLINE", "Politik"],
-    "https://www.derstandard.at/": ["International", "Inland"],
-    "https://www.golem.de/": ["Golem", "News"],
+    "https://store.steampowered.com/app/271590/Grand_Theft_Auto_V_Legacy/": ["Rockstar North"],
+    "https://store.steampowered.com/app/1091500/Cyberpunk_2077/": ["CD PROJEKT RED"],
+    "https://www.nu.nl/": ["Net binnen", "Voorpagina"],
+    "https://tweakers.net/": ["Pricewatch"],
+    "https://www.volkskrant.nl/": ["Opinie"],
+    "https://www.ad.nl/": ["Sport"],
+    "https://www.derstandard.at/": ["Inland"],
+    "https://www.golem.de/": ["golem.de/news/"],
+    "https://www.southwest.com/": ["Book a flight", "Flight status", "Low Fare Calendar"],
+    "https://www.zeit.de/index": ["ZEIT ONLINE"],
+}
+
+
+# Popular pages both services can fetch: a like-for-like latency comparison.
+SPEED = {
+    "https://en.wikipedia.org/wiki/Web_scraping": ["Web scraping"],
+    "https://www.python.org/": ["Python"],
+    "https://news.ycombinator.com/": ["Hacker News"],
+    "https://www.bbc.com/news": ["BBC"],
+    "https://www.spiegel.de/": ["SPIEGEL"],
+    "https://github.com/trending": ["Trending"],
+    "https://www.theguardian.com/international": ["Guardian"],
+    "https://store.steampowered.com/app/413150/Stardew_Valley/": ["Stardew Valley", "ConcernedApe"],
 }
 
 
@@ -77,9 +92,11 @@ def main() -> None:
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--string-js", action="store_true", help="also call String with executeJS")
     ap.add_argument("--only", nargs="*", help="subset of URLs")
+    ap.add_argument("--set", choices=["gated", "speed"], default="gated")
     ap.add_argument("--out", default="bench/results.jsonl")
     a = ap.parse_args()
-    urls = a.only or list(CASES)
+    cases = CASES if a.set == "gated" else SPEED
+    urls = a.only or list(cases)
     rows = []
     with open(a.out, "a", encoding="utf-8") as fh:
         for run in range(a.runs):
@@ -89,7 +106,7 @@ def main() -> None:
                     calls.append(lambda: string_call(url, True))
                 for call in calls:
                     r = call()
-                    markers = CASES.get(url, [])
+                    markers = cases.get(url, [])
                     r["markerHit"] = bool(markers) and any(m.lower() in r["text"].lower() for m in markers)
                     r["success"] = r["http"] == 200 and r["markerHit"]
                     r.update({"url": url, "run": run, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})

@@ -249,6 +249,9 @@ def to_markdown(html: str, base_url: str, mode: str = "full") -> str:
     opts = ConversionOptions(
         extract_metadata=False,
         base_url=base_url,
+        # Inline base64 images (icons, logos) can be half of a page's Markdown and are
+        # useless to a reader or an LLM: keep their alt text only.
+        inline_data_media="alt_text_only",
         exclude_selectors=_OVERLAY_SELECTORS,
         preprocessing=PreprocessingOptions(
             enabled=True,
@@ -261,7 +264,8 @@ def to_markdown(html: str, base_url: str, mode: str = "full") -> str:
 
 
 def to_text(html: str) -> str:
-    opts = ConversionOptions(extract_metadata=False, output_format="plain", exclude_selectors=_OVERLAY_SELECTORS)
+    opts = ConversionOptions(extract_metadata=False, output_format="plain", inline_data_media="alt_text_only",
+                             exclude_selectors=_OVERLAY_SELECTORS)
     return h2m.convert(html, opts).content.strip() + "\n"
 
 
