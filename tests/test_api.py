@@ -93,3 +93,18 @@ def test_batch(server, client):
     assert r.status_code == 200
     res = r.json()["results"]
     assert res[0]["ok"] is True and res[1]["outcome"] == "empty"
+
+
+def test_batch_costs_one_token_per_item():
+    app = create_app(Settings(allow_private=True, anon_rate_per_min=3))
+    with TestClient(app) as c:
+        r = c.post("/v1/batch", json={"requests": [{"url": "ftp://x"}] * 4})
+    assert r.status_code == 429
+
+
+def test_rate_limit_uses_rightmost_forwarded_for():
+    app = create_app(Settings(allow_private=True, anon_rate_per_min=1))
+    with TestClient(app) as c:
+        a = c.post("/v1/fetch", json={"url": "ftp://x"}, headers={"x-forwarded-for": "1.1.1.1, 9.9.9.9"})
+        b = c.post("/v1/fetch", json={"url": "ftp://x"}, headers={"x-forwarded-for": "2.2.2.2, 9.9.9.9"})
+    assert a.status_code == 400 and b.status_code == 429  # spoofed left entry does not help

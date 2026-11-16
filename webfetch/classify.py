@@ -115,10 +115,14 @@ def classify(
 
     parts = urlsplit(final_url)
     host = (parts.hostname or "").lower()
-    if CONSENT_URL_PATTERNS.search(host) or CONSENT_PATH_PATTERNS.search(parts.path):
-        return Verdict("consent_wall", f"landed on a consent page ({host}{parts.path})")
-    if AGE_PATH_PATTERNS.search(parts.path):
-        return Verdict("age_gate", f"landed on an age-verification page ({parts.path})")
+    # URL patterns only count when we were sent there (or the page is nearly empty), so an
+    # article that merely lives under /consent/ is not mistaken for a wall.
+    detoured = urlsplit(original_url)[:3] != parts[:3]
+    if detoured or visible_chars < WEAK_TEXT_LIMIT:
+        if CONSENT_URL_PATTERNS.search(host) or CONSENT_PATH_PATTERNS.search(parts.path):
+            return Verdict("consent_wall", f"landed on a consent page ({host}{parts.path})")
+        if AGE_PATH_PATTERNS.search(parts.path):
+            return Verdict("age_gate", f"landed on an age-verification page ({parts.path})")
     if visible_chars < WEAK_TEXT_LIMIT and title:
         if _AGE_TITLE.search(title):
             return Verdict("age_gate", f"age-verification page (title: {title[:80]!r})")

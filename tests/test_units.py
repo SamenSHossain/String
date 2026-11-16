@@ -110,3 +110,9 @@ def test_markdown_absolute_links():
 ])
 def test_parse_number(raw, num):
     assert parse_number(raw) == num
+
+
+def test_consent_path_only_counts_after_a_detour():
+    article = "<html><body>" + "An article about consent management. " * 60 + "</body></html>"
+    assert _verdict(200, article, url="https://gdpr.example/consent/", final="https://gdpr.example/consent/").outcome == "ok"
+    assert _verdict(200, article, url="https://news.example/", final="https://news.example/consent/").outcome == "consent_wall"

@@ -140,24 +140,26 @@ class RateLimiter:
     def __init__(self):
         self.buckets: dict[str, tuple[float, float]] = {}
 
-    def allow(self, key: str, per_minute: int) -> tuple[bool, float]:
+    def allow(self, key: str, per_minute: int, cost: float = 1.0) -> tuple[bool, float]:
         now = time.monotonic()
         rate = per_minute / 60.0
         tokens, last = self.buckets.get(key, (float(per_minute), now))
         tokens = min(float(per_minute), tokens + (now - last) * rate)
-        if tokens >= 1.0:
-            self.buckets[key] = (tokens - 1.0, now)
+        if tokens >= cost:
+            self.buckets[key] = (tokens - cost, now)
             return True, 0.0
         self.buckets[key] = (tokens, now)
         if len(self.buckets) > 20_000:
             self.buckets.clear()
-        return False, (1.0 - tokens) / rate
+        return False, (cost - tokens) / rate
 
 
 def _client_ip(request: Request) -> str:
+    # The platform proxy appends the connecting address; earlier entries are whatever the
+    # client sent, so only the rightmost one is trustworthy for rate limiting.
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
-        return fwd.split(",")[0].strip()
+        return fwd.split(",")[-1].strip()
     return request.client.host if request.client else "unknown"
 
 
@@ -225,14 +227,14 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
                                  "outcome": response.headers.get("x-outcome"), "ms": ms}))
         return response
 
-    def _auth(request: Request) -> JSONResponse | None:
+    def _auth(request: Request, cost: int = 1) -> JSONResponse | None:
         rid = request.state.rid
         key = _api_key(request)
         if key is not None and settings.api_keys and key not in settings.api_keys:
             return _error(401, "unauthorized", "invalid API key", rid)
         keyed = key is not None and key in settings.api_keys
         ident = f"key:{key}" if keyed else f"ip:{_client_ip(request)}"
-        allowed, wait = limiter.allow(ident, settings.key_rate_per_min if keyed else settings.anon_rate_per_min)
+        allowed, wait = limiter.allow(ident, settings.key_rate_per_min if keyed else settings.anon_rate_per_min, cost)
         if not allowed:
             resp = _error(429, "rate_limited", f"too many requests; retry in {wait:.1f}s", rid)
             resp.headers["retry-after"] = str(max(1, int(wait + 0.999)))
@@ -325,7 +327,7 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
 
     @app.post("/v1/batch")
     async def batch(body: BatchBody, request: Request):
-        denied = _auth(request)
+        denied = _auth(request, cost=len(body.requests))
         if denied is not None:
             return denied
         rid = request.state.rid
