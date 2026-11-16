@@ -27,8 +27,9 @@ class Browser:
         await self.pool.start()
 
     @modal.method()
-    async def render(self, url: str, cookies: list, headers: dict | None, timeout: float) -> dict:
-        return await self.pool.render(url, cookies=cookies, headers=headers, timeout=timeout)
+    async def render(self, url: str, cookies: list, headers: dict | None, timeout: float,
+                     max_bytes: int = 10 * 1024 * 1024) -> dict:
+        return await self.pool.render(url, cookies=cookies, headers=headers, timeout=timeout, max_bytes=max_bytes)
 
     @modal.exit()
     async def stop(self):

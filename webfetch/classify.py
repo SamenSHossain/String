@@ -33,7 +33,7 @@ from .gates import AGE_PATH_PATTERNS, CONSENT_PATH_PATTERNS, CONSENT_URL_PATTERN
 # quotes errors.edgesuite.net must not be mistaken for the interstitial itself.
 _TITLE_CHALLENGE = re.compile(r"<title>\s*just a moment\.\.\.\s*</title>")
 _STRONG = [
-    ("cloudflare", "challenge", re.compile(r"cf_chl_opt|cf-browser-verification|<div[^>]+id=\"challenge-(form|running|stage)\"")),
+    ("cloudflare", "challenge", re.compile(r"cf_chl_opt|cf-browser-verification|<div\b[^>]{0,300}?\bid=\"challenge-(form|running|stage)\"")),
     ("cloudflare", "blocked", re.compile(r"<title>\s*attention required! \| cloudflare\s*</title>")),
     ("datadome", "challenge", re.compile(r"geo\.captcha-delivery\.com|ct\.captcha-delivery\.com|interstitial\.captcha-delivery\.com")),
     ("perimeterx", "challenge", re.compile(r"px-captcha|_pxcaptcha|captcha\.px-cdn\.net|<title>\s*access to this page has been denied")),
@@ -55,7 +55,9 @@ _WEAK = [
     ("captcha", "challenge", re.compile(r"g-recaptcha|h-captcha|hcaptcha\.com/1/api\.js|recaptcha/api\.js")),
     ("generic", "blocked", re.compile(r"<title>\s*(access denied|forbidden|request blocked|403 forbidden)\s*</title>")),
 ]
-_ROOT_SHELL = re.compile(r"""<div[^>]+id=["'](root|app|__next|__nuxt|main|application|svelte)["'][^>]*>\s*</div>""")
+# Quantifiers are bounded on purpose: unbounded [^>]+ over 200 KB of hostile markup is
+# quadratic, and the regex engine holds the GIL while it runs.
+_ROOT_SHELL = re.compile(r"""<div\b[^>]{0,300}?\bid=["'](root|app|__next|__nuxt|main|application|svelte)["'][^>]{0,300}>\s{0,200}</div>""")
 _JS_REQUIRED = re.compile(
     r"(enable|activate|turn on)\s+javascript|javascript\s+(is\s+)?(required|disabled|must be enabled)|"
     r"requires\s+javascript|you need to enable javascript",
@@ -140,6 +142,8 @@ def classify(
             if pat.search(head):
                 return Verdict(outcome, f"{vendor} signature on a {'refusal' if refusal else 'near-empty'} page", vendor)
     if status == 503:
+        if visible_chars < STRONG_TEXT_LIMIT and _SOFT_LIMIT.search(head):
+            return Verdict("rate_limited", "destination served a rate-limit notice (503)")
         return Verdict("server_error", "destination answered 503")
 
     parts = urlsplit(final_url)

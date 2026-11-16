@@ -21,11 +21,39 @@ from .gates import GateEvent, check_response, presets_for
 from .netguard import BlockedDestination, InvalidUrl, ip_is_public, normalize_url, resolve_public
 
 _REDIRECT = {301, 302, 303, 307, 308}
-_META_REFRESH = re.compile(
-    rb"""<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["']?\s*(\d+)\s*[;,]\s*url\s*=\s*['"]?([^"'>\s]+)""",
-    re.I,
-)
-_NOSCRIPT = re.compile(rb"<noscript\b.*?</noscript\s*>", re.I | re.S)
+_META_TAG = re.compile(rb"<meta\b[^>]{0,1024}>", re.I)  # bounded: linear on hostile input
+_REFRESH_URL = re.compile(rb"""content\s*=\s*["']?\s*(\d{1,4})\s*[;,]\s*url\s*=\s*['"]?([^"'>\s]{1,2048})""", re.I)
+# Sent on hops to other origins only if the caller did not set them (as curl and requests do).
+_ORIGIN_BOUND_HEADERS = {"authorization", "cookie", "proxy-authorization"}
+
+
+def _strip_noscript(html: bytes) -> bytes:
+    """Remove <noscript>...</noscript> blocks with a linear scan (no backtracking)."""
+    out, pos, low = [], 0, html.lower()
+    while True:
+        start = low.find(b"<noscript", pos)
+        if start < 0:
+            out.append(html[pos:])
+            return b"".join(out)
+        out.append(html[pos:start])
+        end = low.find(b"</noscript", start)
+        if end < 0:
+            return b"".join(out)
+        pos = end + len(b"</noscript")
+
+
+def _meta_refresh(html: bytes) -> tuple[int, str] | None:
+    """The first <meta http-equiv="refresh" content="N; url=..."> outside <noscript>."""
+    for tag in _META_TAG.finditer(_strip_noscript(html)):
+        t = tag.group(0)
+        if b"refresh" not in t.lower() or b"http-equiv" not in t.lower():
+            continue
+        m = _REFRESH_URL.search(t)
+        if m:
+            return int(m.group(1)), m.group(2).decode("latin-1")
+    return None
+
+
 _HTTP_VERSIONS = {1: "1.0", 2: "1.1", 3: "2", 4: "2", 5: "2", 30: "3", 31: "3"}
 _INFOS = [CurlInfo.NAMELOOKUP_TIME, CurlInfo.CONNECT_TIME, CurlInfo.APPCONNECT_TIME,
           CurlInfo.STARTTRANSFER_TIME, CurlInfo.TOTAL_TIME]
@@ -187,6 +215,10 @@ class HttpFetcher:
                 # Per-hop options (DNS pin, size cap). The session belongs to this request
                 # only, so replacing its option dict between hops is safe.
                 session.curl_options = curl_options
+                same_origin = (hop_target.scheme, hop_target.host, hop_target.port) == \
+                    (target.scheme, target.host, target.port)
+                hop_headers = headers if same_origin or not headers else \
+                    {k: v for k, v in headers.items() if k.lower() not in _ORIGIN_BOUND_HEADERS}
                 # Collect the body ourselves: libcurl hands the write callback *decoded*
                 # bytes, so the size cap also stops gzip/brotli decompression bombs, which
                 # CURLOPT_MAXFILESIZE (checked on the wire) does not.
@@ -204,7 +236,7 @@ class HttpFetcher:
                 try:
                     resp = await session.get(
                         current,
-                        headers=headers or None,
+                        headers=hop_headers or None,
                         allow_redirects=False,
                         timeout=remaining,
                         proxy=s.proxy,
@@ -252,10 +284,10 @@ class HttpFetcher:
                 if status == 200 and len(body) < 16384 and meta_refreshes < MAX_META_REFRESH:
                     # A refresh inside <noscript> only fires for browsers with JavaScript off;
                     # following it lands on "JavaScript required" pages a real visitor never sees.
-                    m = _META_REFRESH.search(_NOSCRIPT.sub(b"", body))
-                    if m and int(m.group(1)) <= 5:
+                    refresh = _meta_refresh(body)
+                    if refresh and refresh[0] <= 5:
                         meta_refreshes += 1
-                        current = urljoin(current, _html.unescape(m.group(2).decode("latin-1")))
+                        current = urljoin(current, _html.unescape(refresh[1]))
                         continue
                 break
 

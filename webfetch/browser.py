@@ -8,12 +8,10 @@ when installed, plain Playwright otherwise, with full Chromium in new-headless m
 from __future__ import annotations
 
 import asyncio
-import ipaddress
-import socket
 import time
 from urllib.parse import urlsplit
 
-from .netguard import host_is_blocked, ip_is_public
+from .egress import EgressProxy
 
 # DOM markers of interstitials that finish by reloading the page. DOM-only on purpose:
 # patchright evaluates in an isolated world where page globals are not visible.
@@ -26,23 +24,6 @@ CHALLENGE_TITLES = ("just a moment", "attention required", "please wait", "check
 BLOCKED_RESOURCES = {"image", "media", "font"}
 
 
-async def _host_is_public(host: str, cache: dict[str, bool]) -> bool:
-    if host in cache:
-        return cache[host]
-    ok = False
-    if host and not host_is_blocked(host):
-        try:
-            ok = ip_is_public(str(ipaddress.ip_address(host.strip("[]"))))
-        except ValueError:
-            try:
-                infos = await asyncio.get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-                ok = bool(infos) and all(ip_is_public(i[4][0]) for i in infos)
-            except OSError:
-                ok = True  # let the browser report the DNS failure itself
-    cache[host] = ok
-    return ok
-
-
 class BrowserPool:
     def __init__(self, *, allow_private: bool = False, executable_path: str | None = None) -> None:
         self._pw = None
@@ -51,6 +32,7 @@ class BrowserPool:
         self._lock = asyncio.Lock()
         self.allow_private = allow_private  # tests only
         self.executable_path = executable_path
+        self.egress: EgressProxy | None = None
 
     async def start(self) -> None:
         async with self._lock:
@@ -64,12 +46,19 @@ class BrowserPool:
                 self.engine = "playwright"
             if self._pw is None:
                 self._pw = await async_playwright().start()
+            if self.egress is None:
+                self.egress = EgressProxy(allow_private=self.allow_private)
+                await self.egress.start()
             launch_kw = {"executable_path": self.executable_path} if self.executable_path else {"channel": "chromium"}
             self._browser = await self._pw.chromium.launch(
                 **launch_kw,
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled",
-                      "--lang=en-US"],
+                      "--lang=en-US",
+                      # All traffic through the checking egress proxy, loopback included;
+                      # no QUIC or WebRTC UDP that could go around it.
+                      f"--proxy-server=http://127.0.0.1:{self.egress.port}", "--proxy-bypass-list=<-loopback>",
+                      "--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"],
             )
 
     async def stop(self) -> None:
@@ -77,17 +66,19 @@ class BrowserPool:
             await self._browser.close()
         if self._pw is not None:
             await self._pw.stop()
-        self._browser = self._pw = None
+        if self.egress is not None:
+            await self.egress.stop()
+        self._browser = self._pw = self.egress = None
 
-    async def render(self, url: str, *, cookies: list[dict], headers: dict | None, timeout: float) -> dict:
+    async def render(self, url: str, *, cookies: list[dict], headers: dict | None, timeout: float,
+                     max_bytes: int = 10 * 1024 * 1024) -> dict:
         t0 = time.monotonic()
         deadline = t0 + timeout
         await self.start()
         ctx = await self._browser.new_context(
             locale="en-US", timezone_id="America/New_York", viewport={"width": 1366, "height": 900},
-            extra_http_headers=headers or None,
         )
-        dns_cache: dict[str, bool] = {}
+        origin = urlsplit(url)[:2]
         try:
             if cookies:
                 await ctx.add_cookies([{"name": c["name"], "value": c["value"], "domain": c["domain"],
@@ -98,19 +89,9 @@ class BrowserPool:
                 req = route.request
                 if req.resource_type in BLOCKED_RESOURCES:
                     return await route.abort()
-                if self.allow_private:
-                    return await route.continue_()
-                host = urlsplit(req.url).hostname or ""
-                if req.is_navigation_request():
-                    if not await _host_is_public(host, dns_cache):
-                        return await route.abort("blockedbyclient")
-                else:
-                    try:
-                        if not ip_is_public(str(ipaddress.ip_address(host.strip("[]")))):
-                            return await route.abort("blockedbyclient")
-                    except ValueError:
-                        if host_is_blocked(host):
-                            return await route.abort("blockedbyclient")
+                # Caller headers (auth, cookies) only go to the origin the caller named.
+                if headers and urlsplit(req.url)[:2] == origin:
+                    return await route.continue_(headers={**req.headers, **headers})
                 await route.continue_()
 
             await page.route("**/*", guard)
@@ -151,6 +132,9 @@ class BrowserPool:
                 await page.wait_for_timeout(500)
             resp = nav["resp"] or resp
             html = await page.content()
+            if len(html) > max_bytes:
+                return {"error": "too_large", "message": f"rendered page is larger than {max_bytes} bytes",
+                        "ms": round((time.monotonic() - t0) * 1000, 1)}
             status = resp.status if resp is not None else 0
             hdrs = await resp.all_headers() if resp is not None else {}
             return {

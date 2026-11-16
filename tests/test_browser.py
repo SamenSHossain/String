@@ -39,3 +39,24 @@ def test_client_rendered_page(server):
     port = server.server_address[1]
     out = _render(f"http://127.0.0.1:{port}/spa")
     assert "Rendered by JavaScript" in out["html"]
+
+
+def test_browser_redirect_to_metadata_is_refused_by_egress(server, monkeypatch):
+    """A public page that 302s the browser to 169.254.169.254 must not be fetched."""
+    from tests import fakedns
+    from webfetch import egress
+
+    monkeypatch.setattr(egress, "resolve_public", fakedns.resolve)  # echo.test -> local server
+    port = server.server_address[1]
+
+    async def go():
+        pool = BrowserPool(allow_private=False, executable_path=CHROMIUM)
+        try:
+            out = await pool.render(f"http://echo.test:{port}/to-metadata", cookies=[], headers=None, timeout=15)
+            return out, list(pool.egress.refused)
+        finally:
+            await pool.stop()
+
+    out, refused = asyncio.run(go())
+    assert any("169.254.169.254" in r for r in refused), refused
+    assert "meta-data" not in (out.get("html") or "")

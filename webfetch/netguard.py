@@ -134,7 +134,7 @@ async def resolve_public(host: str, port: int, *, allow_private: bool = False) -
     if not allow_private:
         bad = [ip for ip in ips if not ip_is_public(ip)]
         if bad:
-            raise BlockedDestination(f"{host} resolves to a non-public address ({bad[0]})")
+            raise BlockedDestination(f"{host} does not resolve to a public address")
     # Prefer IPv4 first (more widely routable from cloud egress), keep IPv6 as fallback.
     ips.sort(key=lambda ip: ":" in ip)
     return ips

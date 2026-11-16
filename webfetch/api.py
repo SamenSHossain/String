@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from . import __version__
 from .config import Settings, load_settings
 from .fetcher import HttpFetcher
-from .netguard import BlockedDestination, InvalidUrl, normalize_url
+from .netguard import BlockedDestination, InvalidUrl, normalize_url, resolve_public
 from .service import JSON_INCLUDES, BrowserClient, Expect, FetchOptions, run_fetch
 
 log = logging.getLogger("webfetch")
@@ -40,7 +40,27 @@ _CHARSET_LABELS = {"cp932": "Shift_JIS", "gb18030": "GB18030", "big5hkscs": "Big
 FORBIDDEN_HEADERS = {"host", "connection", "content-length", "transfer-encoding", "te", "upgrade",
                      "keep-alive", "trailer", "proxy-authorization", "proxy-authenticate", "proxy-connection"}
 MAX_SCHEMA_BYTES = 50_000
+MAX_SCHEMA_KEYS = 200
+MAX_SCHEMA_DEPTH = 10
 MAX_BATCH = 20
+BROWSER_COST = 5  # a headless-browser render uses ~5x the resources of an HTTP fetch
+
+
+def _schema_size(node: Any, depth: int = 0) -> tuple[int, int]:
+    """(number of keys, nesting depth) of a JSON value."""
+    if isinstance(node, dict):
+        keys, deepest = len(node), depth
+        for v in node.values():
+            k, d = _schema_size(v, depth + 1)
+            keys, deepest = keys + k, max(deepest, d)
+        return keys, deepest
+    if isinstance(node, list):
+        keys, deepest = 0, depth
+        for v in node:
+            k, d = _schema_size(v, depth + 1)
+            keys, deepest = keys + k, max(deepest, d)
+        return keys, deepest
+    return 0, depth
 
 
 class ExpectModel(BaseModel):
@@ -78,7 +98,7 @@ class FetchBody(BaseModel):
     headers: dict[str, str] | None = None
     cookies: dict[str, str] | None = None
     timeout: float | None = Field(None, gt=0, le=90)
-    maxBytes: int | None = Field(None, gt=0, le=25 * 1024 * 1024)
+    maxBytes: int | None = Field(None, gt=0, le=10 * 1024 * 1024)
 
     @field_validator("include")
     @classmethod
@@ -114,6 +134,9 @@ class FetchBody(BaseModel):
             raise ValueError(f"jsonSchema is larger than {MAX_SCHEMA_BYTES} bytes")
         if v.get("type") not in ("object", None) or not isinstance(v.get("properties"), dict):
             raise ValueError('jsonSchema must be an object schema with "properties"')
+        keys, depth = _schema_size(v)
+        if keys > MAX_SCHEMA_KEYS or depth > MAX_SCHEMA_DEPTH:
+            raise ValueError(f"jsonSchema is limited to {MAX_SCHEMA_KEYS} keys and nesting depth {MAX_SCHEMA_DEPTH}")
         return v
 
     def to_options(self) -> FetchOptions:
@@ -240,15 +263,25 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
         response.headers["x-request-id"] = rid
         response.headers["x-request-duration-ms"] = str(ms)
         if request.url.path.startswith("/v1/"):
+            # Fetched pages are third-party content: never let them run on this origin.
+            response.headers["content-security-policy"] = "sandbox; default-src 'none'"
+            response.headers["x-content-type-options"] = "nosniff"
+            response.headers["x-frame-options"] = "DENY"
+        if request.url.path.startswith("/v1/"):
             log.info(json.dumps({"rid": rid, "path": request.url.path, "status": response.status_code,
                                  "outcome": response.headers.get("x-outcome"), "ms": ms}))
         return response
 
+    def _client_id(request: Request) -> str:
+        key = _api_key(request)
+        return f"key:{key}" if key and key in settings.api_keys else f"ip:{_client_ip(request)}"
+
     def _auth(request: Request, cost: int = 1) -> JSONResponse | None:
         rid = request.state.rid
         key = _api_key(request)
-        if key is not None and settings.api_keys and key not in settings.api_keys:
-            return _error(401, "unauthorized", "invalid API key", rid)
+        if settings.api_keys and key not in settings.api_keys:
+            # With WEBFETCH_API_KEYS set, every request needs one of the keys.
+            return _error(401, "unauthorized", "a valid API key is required", rid)
         keyed = key is not None and key in settings.api_keys
         ident = f"key:{key}" if keyed else f"ip:{_client_ip(request)}"
         allowed, wait = limiter.allow(ident, settings.key_rate_per_min if keyed else settings.anon_rate_per_min, cost)
@@ -258,10 +291,17 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
             return resp
         return None
 
-    async def _do_fetch(body: FetchBody, rid: str) -> Response:
+    async def _do_fetch(body: FetchBody, rid: str, client: str = "anonymous") -> Response:
         opts = body.to_options()
+        opts.client = client
         try:
-            normalize_url(opts.url)
+            target = normalize_url(opts.url)
+            if settings.proxy is None:
+                # Same 403 whichever tier would run (the browser tier has its own egress check too).
+                try:
+                    await resolve_public(target.host, target.port, allow_private=settings.allow_private)
+                except InvalidUrl:
+                    pass  # DNS failure: the fetch itself reports it as dns_error
             env = await run_fetch(opts, fetcher, app.state.browser)
         except InvalidUrl as exc:
             return _error(400, "invalid_url", str(exc), rid)
@@ -307,6 +347,7 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
                 # Original bytes in their original encoding: label it, or clients assume UTF-8.
                 ctype = f"{ctype}; charset={_CHARSET_LABELS.get(env.get('encoding', ''), env.get('encoding') or 'utf-8')}"
             hdrs["content-type"] = ctype
+            hdrs["content-disposition"] = "attachment"
             return Response(raw or b"", headers=hdrs)
         return Response((env.get("html") or "").encode("utf-8"), media_type="text/html; charset=utf-8", headers=hdrs)
 
@@ -333,10 +374,10 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
 
     @app.post("/v1/fetch")
     async def fetch_post(body: FetchBody, request: Request):
-        denied = _auth(request)
+        denied = _auth(request, cost=BROWSER_COST if body.to_options().render == "always" else 1)
         if denied is not None:
             return denied
-        return await _do_fetch(body, request.state.rid)
+        return await _do_fetch(body, request.state.rid, _client_id(request))
 
     @app.get("/v1/fetch")
     async def fetch_get(request: Request, url: str, format: str = "json", markdownMode: str = "full",
@@ -350,11 +391,16 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
                              include=[x.strip() for x in include.split(",") if x.strip()] if include else None)
         except Exception as exc:  # pydantic ValidationError
             return _error(400, "validation_error", str(exc).splitlines()[0][:300], request.state.rid)
-        return await _do_fetch(body, request.state.rid)
+        if render == "always":
+            denied = _auth(request, cost=BROWSER_COST - 1)  # one token was already taken above
+            if denied is not None:
+                return denied
+        return await _do_fetch(body, request.state.rid, _client_id(request))
 
     @app.post("/v1/batch")
     async def batch(body: BatchBody, request: Request):
-        denied = _auth(request, cost=len(body.requests))
+        denied = _auth(request, cost=sum(BROWSER_COST if r.to_options().render == "always" else 1
+                                         for r in body.requests))
         if denied is not None:
             return denied
         rid = request.state.rid
@@ -364,7 +410,7 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
             async with sem:
                 if item.format != "json":
                     item = item.model_copy(update={"format": "json"})
-                resp = await _do_fetch(item, f"{rid}:{i}")
+                resp = await _do_fetch(item, f"{rid}:{i}", _client_id(request))
                 return json.loads(resp.body)
 
         t0 = time.monotonic()

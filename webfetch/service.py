@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -23,7 +24,11 @@ ALT_IMPERSONATE = "safari"
 
 class BrowserClient(Protocol):
     async def render(self, url: str, *, cookies: list[dict], headers: dict[str, str] | None,
-                     timeout: float) -> dict[str, Any]: ...
+                     timeout: float, max_bytes: int = ...) -> dict[str, Any]: ...
+
+
+MAX_BROWSER_PER_CLIENT = 2
+_active_renders: dict[str, int] = {}
 
 
 @dataclass
@@ -48,6 +53,7 @@ class FetchOptions:
     cookies: dict[str, str] | None = None
     timeout: float | None = None
     max_bytes: int | None = None
+    client: str = "anonymous"  # set by the API layer; not user input
 
 
 @dataclass
@@ -88,9 +94,76 @@ def _validate(expect: Expect | None, page: Page) -> dict | None:
     return {"passed": all(c["passed"] for c in checks), "checks": checks}
 
 
+MAX_PARSE_CHARS = 6_000_000
+MAX_NESTING = 1500
+MAX_CONCURRENT_ANALYSIS = 4
+_TAG = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]{0,15})(?=[\s/>])")
+# Only HTML container/formatting elements count toward depth: SVG children (<path/>,
+# <use/>) self-close, and p/li/td-style elements are routinely left unclosed.
+_COUNTED = {"div", "span", "section", "article", "aside", "nav", "header", "footer", "main", "ul", "ol", "dl",
+            "table", "form", "b", "i", "u", "s", "em", "strong", "small", "big", "font", "a", "blockquote",
+            "center", "figure", "figcaption", "label", "button", "select", "details", "summary", "fieldset",
+            "code", "pre", "q", "cite", "abbr", "sub", "sup", "mark", "del", "ins", "h1", "h2", "h3", "h4", "h5",
+            "h6", "picture", "object", "nobr", "tt", "strike", "dfn", "kbd", "samp", "var", "bdo", "bdi", "time",
+            "address", "hgroup", "search", "menu", "map", "canvas", "video", "audio", "legend", "output"}
+_analysis_slots: dict[int, asyncio.Semaphore] = {}
+
+
+class TooComplex(Exception):
+    pass
+
+
+def _check_nesting(text: str) -> None:
+    """HTML parsers are quadratic on pathological nesting (100k nested <div>s take
+    minutes); browsers cap the DOM depth for the same reason. Refuse such pages early with
+    one linear scan."""
+    if len(text) < 100_000:
+        return
+    depth = 0
+    for m in _TAG.finditer(_strip_raw_text(text)):
+        name = m.group(2).lower()
+        if name not in _COUNTED:
+            continue
+        if m.group(1):
+            depth = depth - 1 if depth else 0
+        else:
+            depth += 1
+            if depth > MAX_NESTING:
+                raise TooComplex(f"page nests elements more than {MAX_NESTING} levels deep")
+
+
+def _strip_raw_text(text: str) -> str:
+    """Drop <script>/<style> contents (where '<d' or '<i' are code, not tags), linearly."""
+    low = text.lower()
+    out, pos = [], 0
+    while True:
+        starts = [i for i in (low.find("<script", pos), low.find("<style", pos)) if i >= 0]
+        if not starts:
+            out.append(text[pos:])
+            return "".join(out)
+        start = min(starts)
+        closer = "</script" if low.startswith("<script", start) else "</style"
+        out.append(text[pos:start])
+        end = low.find(closer, start)
+        if end < 0:
+            return "".join(out)
+        pos = end + len(closer)
+
+
+async def _bounded(fn, *args):
+    """Run CPU-heavy page work in a thread, at most a few at a time per process."""
+    loop = asyncio.get_running_loop()
+    sem = _analysis_slots.setdefault(id(loop), asyncio.Semaphore(MAX_CONCURRENT_ANALYSIS))
+    async with sem:
+        return await asyncio.to_thread(fn, *args)
+
+
 def _analyze(result: FetchResult, expect: Expect | None) -> Page:
     ctype = result.headers.get("content-type", "")
     text, enc, enc_src = decode_body(result.body, ctype)
+    if len(text) > MAX_PARSE_CHARS:
+        text = text[:MAX_PARSE_CHARS]
+    _check_nesting(text)
     sniff = text[:1024].lstrip().lower()
     is_html = "html" in ctype.lower() or sniff.startswith(("<!doctype html", "<html", "<head", "<body"))
     tree = extract.parse(text) if is_html else None
@@ -172,7 +245,13 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
                              "error": exc.code, "message": exc.message,
                              "ms": round((time.monotonic() - a0) * 1000, 1)})
             return None
-        page = await asyncio.to_thread(_analyze, res, opts.expect)
+        try:
+            page = await _bounded(_analyze, res, opts.expect)
+        except TooComplex as exc:
+            last_error = FetchError("too_complex", str(exc))
+            attempts.append({"strategy": res.strategy, "error": "too_complex", "message": str(exc),
+                             "ms": round((time.monotonic() - a0) * 1000, 1)})
+            return None
         attempts.append({"strategy": res.strategy, "outcome": page.verdict.outcome, "statusCode": res.status,
                          "ms": round((time.monotonic() - a0) * 1000, 1),
                          **({"validationPassed": page.validation["passed"]} if page.validation else {})})
@@ -182,16 +261,27 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
         if browser is None:
             return None
         a0 = time.monotonic()
+        if _active_renders.get(opts.client, 0) >= MAX_BROWSER_PER_CLIENT:
+            attempts.append({"strategy": "browser:chromium", "error": "browser_busy",
+                             "message": f"at most {MAX_BROWSER_PER_CLIENT} concurrent browser renders per client",
+                             "ms": 0.0})
+            return None
+        _active_renders[opts.client] = _active_renders.get(opts.client, 0) + 1
         try:
             data = await asyncio.wait_for(browser.render(
                 normalize_url(opts.url).url,
                 cookies=_browser_cookies(opts.url, opts.cookies, opts.resolve_gates),
                 headers=opts.headers, timeout=max(left() - 1.0, 1.0),
+                max_bytes=opts.max_bytes or fetcher.settings.max_bytes,
             ), timeout=max(left(), 1.0))
         except Exception as exc:  # browser tier is best effort
             attempts.append({"strategy": "browser:chromium", "error": "browser_error",
                              "message": str(exc)[:300], "ms": round((time.monotonic() - a0) * 1000, 1)})
             return None
+        finally:
+            _active_renders[opts.client] -= 1
+            if _active_renders[opts.client] <= 0:
+                _active_renders.pop(opts.client, None)
         if data.get("error"):
             attempts.append({"strategy": "browser:chromium", "error": data.get("error"),
                              "message": str(data.get("message", ""))[:300],
@@ -202,7 +292,12 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
             gates = [GateEvent(r.name, r.kind, "preset", "browser started with the gate cookies")
                      for r, _d, _c in presets_for(normalize_url(opts.url).host)]
         res = _browser_result(opts.url, data, gates)
-        page = await asyncio.to_thread(_analyze, res, opts.expect)
+        try:
+            page = await _bounded(_analyze, res, opts.expect)
+        except TooComplex as exc:
+            attempts.append({"strategy": res.strategy, "error": "too_complex", "message": str(exc),
+                             "ms": round((time.monotonic() - a0) * 1000, 1)})
+            return None
         attempts.append({"strategy": res.strategy, "outcome": page.verdict.outcome, "statusCode": res.status,
                          "ms": round((time.monotonic() - a0) * 1000, 1),
                          **({"validationPassed": page.validation["passed"]} if page.validation else {})})
@@ -214,11 +309,14 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
         best = await http_attempt(None)
         refused = (best is not None and not best.verdict.ok and best.verdict.outcome in {"challenge", "blocked", "rate_limited"}) \
             or (best is None and last_error is not None and last_error.code in {"http2_error", "connection_error", "tls_error"})
+        if best is None and last_error is not None and last_error.code in {"too_complex", "too_large"}:
+            refused = False
         if refused and left() > MIN_ESCALATION_SECONDS:
             alt = await http_attempt(ALT_IMPERSONATE)
             if alt is not None and (best is None or _good(alt) or (not best.verdict.ok and alt.verdict.ok)):
                 best = alt
-        needs_browser = best is None or not _good(best)
+        needs_browser = (best is None or not _good(best)) and not (
+            best is None and last_error is not None and last_error.code in {"too_complex", "too_large"})
         if needs_browser and opts.render == "auto" and browser is not None and left() > MIN_ESCALATION_SECONDS:
             if best is None or best.verdict.browser_may_help or (best.verdict.ok and not _good(best)):
                 rendered = await browser_attempt()
@@ -238,7 +336,7 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
         }
 
     p0 = time.monotonic()
-    envelope = await asyncio.to_thread(_render_outputs, best, opts)
+    envelope = await _bounded(_render_outputs, best, opts)
     process_ms = round((time.monotonic() - p0) * 1000, 1)
     r = best.result
     envelope.update({

@@ -31,7 +31,7 @@ class Settings:
     # CA bundle for TLS verification. None means curl_cffi's bundled certifi store.
     ca_bundle: str | None = None
     impersonate: str = "chrome"
-    max_bytes: int = 15 * 1024 * 1024
+    max_bytes: int = 8 * 1024 * 1024
     default_timeout: float = 30.0
     max_timeout: float = 90.0
     max_redirects: int = 10
@@ -51,7 +51,7 @@ def load_settings() -> Settings:
         proxy=proxy,
         ca_bundle=ca,
         impersonate=os.environ.get("WEBFETCH_IMPERSONATE", "chrome"),
-        max_bytes=_env_int("WEBFETCH_MAX_BYTES", 15 * 1024 * 1024),
+        max_bytes=_env_int("WEBFETCH_MAX_BYTES", 8 * 1024 * 1024),
         anon_rate_per_min=_env_int("WEBFETCH_ANON_RATE", 30),
         key_rate_per_min=_env_int("WEBFETCH_KEY_RATE", 600),
         browser_mode=os.environ.get("WEBFETCH_BROWSER", "off").strip().lower(),

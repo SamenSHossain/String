@@ -15,9 +15,9 @@ class ModalBrowserClient:
         self._obj = None
 
     async def render(self, url: str, *, cookies: list[dict], headers: dict[str, str] | None,
-                     timeout: float) -> dict[str, Any]:
+                     timeout: float, max_bytes: int = 10 * 1024 * 1024) -> dict[str, Any]:
         import modal
 
         if self._obj is None:
             self._obj = modal.Cls.from_name(self.app_name, self.cls_name)()
-        return await self._obj.render.remote.aio(url, cookies, headers, timeout)
+        return await self._obj.render.remote.aio(url, cookies, headers, timeout, max_bytes)

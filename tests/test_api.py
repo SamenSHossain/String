@@ -11,7 +11,9 @@ from webfetch.config import Settings
 
 @pytest.fixture(autouse=True)
 def fake_dns(monkeypatch):
+    import webfetch.api as api_mod
     monkeypatch.setattr(fetcher_mod, "resolve_public", fakedns.resolve)
+    monkeypatch.setattr(api_mod, "resolve_public", fakedns.resolve)
 
 
 @pytest.fixture()

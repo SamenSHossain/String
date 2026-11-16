@@ -30,7 +30,7 @@ image = (
 @app.function(
     image=image,
     cpu=1.0,
-    memory=1024,
+    memory=2048,
     timeout=300,
     scaledown_window=900,
     max_containers=3,

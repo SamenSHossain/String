@@ -148,6 +148,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(302, headers={"Location": "http://10.0.0.1/admin"})
             if path == "/product":
                 return self._send(200, PRODUCT_PAGE)
+            if path == "/to-metadata":
+                return self._send(302, headers={"Location": "http://169.254.169.254/latest/meta-data/"})
+            if path == "/deep":
+                return self._send(200, "<html><body>" + "<div>" * 3000 + "x" + "</div>" * 3000
+                                  + "<p>" + "pad " * 30000 + "</p></body></html>")
             if path == "/soft-limit":
                 return self._send(200, "<html><body><table><tr><td>Hacker News</td></tr></table>"
                                        "<p>Sorry, we're not able to serve your requests this quickly.</p></body></html>")

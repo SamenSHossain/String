@@ -232,3 +232,10 @@ def test_decompression_bomb_is_capped(server, settings):
     with pytest.raises(FetchError) as exc:
         run(_fetch(settings, f"http://echo.test:{port}/gzip-bomb", max_bytes=1024 * 1024))
     assert exc.value.code == "too_large"
+
+
+def test_pathological_nesting_is_refused(server, settings):
+    port = server.server_address[1]
+    env = run(_pipeline(settings, FetchOptions(url=f"http://echo.test:{port}/deep")))
+    assert env["ok"] is False and env["error"] == "too_complex"
+    assert [a.get("error") for a in env["attempts"]] == ["too_complex"]  # no escalation
