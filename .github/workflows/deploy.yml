@@ -96,7 +96,10 @@ jobs:
         if: steps.creds.outputs.present == 'true'
         shell: bash
         run: |
-          URL="$(grep -oE 'https://[a-z0-9-]+--webfetch\.modal\.run' deploy.log | head -1)"
+          export MODAL_TOKEN_ID="$(printf '%s' "$MODAL_TOKEN_ID" | tr -d '[:space:]')"
+          export MODAL_TOKEN_SECRET="$(printf '%s' "$MODAL_TOKEN_SECRET" | tr -d '[:space:]')"
+          echo "::add-mask::$MODAL_TOKEN_SECRET"
+          URL="$(python -c 'import modal; print(modal.Function.from_name("webfetch", "api").get_web_url())')"
           echo "Endpoint: $URL"
           echo "### Endpoint: $URL" >> "$GITHUB_STEP_SUMMARY"
           python bench/smoke.py "$URL" | tee smoke.jsonl
