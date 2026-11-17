@@ -152,6 +152,17 @@ box for another product while the API lists no price for the app itself. Steam's
 answers are not perfectly stable either: in the first run it gave Cyberpunk 2077's release
 date as Dec 10, 2020, in this one as Dec 9 (the archive keeps both runs).
 
+The result holds wherever the container runs. Steam prices by the store country it infers
+from the caller's IP, and its age gate is per store too: GTA V has one on the US store and
+none on the Polish one. Modal does not keep the container in one region. The run above
+happened to be on a US container (every price in it is USD); on Nov 17 the endpoint went
+out through Azure in Warsaw. So the script now pins the product page to `?cc=us`, as the
+ground truth already was, and decides "age-gated" itself: the same URL fetched with
+`resolveGates: false` has to land on `/agecheck`. Re-run on Nov 17 from Warsaw, webfetch
+only: **118 / 120**, 52 / 54 on the age-gated games, 66 / 66 on the rest, with the same
+two misses and the same 9 games found gated
+([`bench/steam_accuracy_rerun.jsonl`](bench/steam_accuracy_rerun.jsonl)).
+
 Every value carries its source (`"price": "site:steam:[data-price-final]"`,
 `"currency": "microdata:Product.offers.priceCurrency"`, `"headline": "json-ld:BlogPosting.headline"`),
 and a field with no source is `null` and listed in `missing`. Extraction time on the
@@ -265,6 +276,7 @@ pytest -q                                   # 95 tests; a local server emulates 
 python -m webfetch.cli https://www.nu.nl/   # one fetch, JSON line out
 uvicorn --factory webfetch.api:create_app   # local API on :8000
 modal deploy modal_app.py && modal deploy modal_browser.py
+python3 bench/verify_live.py                # 21 pass/fail checks against the live endpoint
 ```
 
 Environment: `WEBFETCH_API_KEYS` (comma-separated; when set, every request needs one),
@@ -276,13 +288,20 @@ Environment: `WEBFETCH_API_KEYS` (comma-separated; when set, every request needs
   refuses a headless Chromium from a datacenter IP. webfetch labels it correctly; getting
   through would need a residential or mobile exit, or a headful browser, which this
   deployment does not have. The same goes for sahibinden.com (Cloudflare Turnstile) and
-  ozon.ru (refuses non-Russian datacenter IPs).
+  ozon.ru (refuses non-Russian datacenter IPs). Centinel does let the odd request through:
+  of five tries in a row on Nov 17 from the Warsaw container, one got the full ZEIT front
+  page over plain HTTP, returned as `ok` (`a279bcb3-8a8e-4477-a13a-cc8251582825`), and
+  four were labelled challenges.
 - **Gate recipes are per site.** Six recipes: Steam, the DPG Media network, ZEIT,
   derStandard, Golem, and Google/YouTube consent. Unknown walls are detected and labelled
   (`consent_wall`, `age_gate`), not resolved.
 - **String with an account was not tested.** Its keyed `actions` (clicks) and AI
   `jsonSchema` might do better than the keyless API on some of these pages.
-- **One region.** Modal runs the endpoint in its default US region; there is no `countryCode`.
+- **Modal picks the region.** Containers run wherever Modal has capacity: the Nov 16
+  benchmarks ran on a US container, and on Nov 17 the endpoint went out through Azure in
+  Warsaw. Sites that localise by IP follow the container: Steam shows złoty there, and
+  GTA V has no age gate. There is no `countryCode`. `?cc=us` pins Steam, and Modal's
+  `region=` option on the functions (not set here) would pin the whole deployment.
 - **Extraction reads only what the page carries.** Fields that exist only as free text
   (not in JSON-LD, microdata, meta tags or a site extractor) come back `null`. An LLM
   fallback for those fields, with each value checked against the page text, is the

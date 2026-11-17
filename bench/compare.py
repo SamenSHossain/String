@@ -32,7 +32,8 @@ CASES = {
     "https://www.derstandard.at/": ["Inland"],
     "https://www.golem.de/": ["golem.de/news/"],
     "https://www.southwest.com/": ["Book a flight", "Flight status", "Low Fare Calendar"],
-    "https://www.zeit.de/index": ["ZEIT ONLINE"],
+    # "ZEIT ONLINE" is only in <title> and the logo, which ZEIT's consent wall shares
+    "https://www.zeit.de/index": ["zeit.de/politik/index", "Aktuelle ZEIT-Ausgabe"],
 }
 
 

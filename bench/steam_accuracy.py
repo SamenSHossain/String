@@ -5,6 +5,11 @@
 Ground truth: https://store.steampowered.com/api/appdetails?appids=<id>&cc=us&l=en
 (fetched through the endpoint as raw JSON). For each game the product page is fetched
 through webfetch with a jsonSchema, and every field is compared with the API value.
+The page URL carries ?cc=us as well: Steam prices by the caller's IP country, and Modal
+places containers wherever it has capacity (a US region and Azure Warsaw so far), so
+without it a run from a Polish container compares złoty prices with dollar ones. (The age
+gate is per store too: GTA V has none on the Polish store and one on the US store.) A game
+counts as age-gated when the same URL fetched with resolveGates false lands on /agecheck.
 
 With --string, the same product page is fetched through String's /v1/fetch (keyless,
 Markdown) and we check whether each true value appears in what String returned at all:
@@ -22,7 +27,7 @@ import urllib.error
 import urllib.request
 
 GAMES = {
-    # age-gated (mature content) on the US store
+    # mature content: Steam sends most of these to the age check on the US store
     271590: "Grand_Theft_Auto_V_Legacy", 1091500: "Cyberpunk_2077", 1174180: "Red_Dead_Redemption_2",
     292030: "The_Witcher_3_Wild_Hunt", 782330: "DOOM_Eternal", 2050650: "Resident_Evil_4",
     1086940: "Baldurs_Gate_3", 1245620: "ELDEN_RING", 381210: "Dead_by_Daylight", 1938090: "Call_of_Duty",
@@ -47,14 +52,25 @@ FIELDS = list(SCHEMA["properties"])
 
 
 def post(url: str, payload: dict, timeout: float = 120) -> tuple[int, dict, bytes, float]:
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
-                                 headers={"Content-Type": "application/json"})
-    t0 = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read(), time.monotonic() - t0
-    except urllib.error.HTTPError as e:
-        return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read(), time.monotonic() - t0
+    """POST JSON. Waits out short 429s: a run makes 40 calls, over the endpoint's 30/min."""
+    for _ in range(5):
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read(), time.monotonic() - t0
+        except urllib.error.HTTPError as e:
+            code, headers = e.code, {k.lower(): v for k, v in e.headers.items()}
+            body, secs = e.read(), time.monotonic() - t0
+        try:
+            wait = float(headers.get("retry-after", "5"))
+        except ValueError:
+            wait = 5.0
+        if code != 429 or wait > 90:
+            break
+        time.sleep(wait + 0.5)
+    return code, headers, body, secs
 
 
 def norm_date(s: str | None) -> str | None:
@@ -86,6 +102,15 @@ def truth_for(ours: str, appid: int) -> dict | None:
         "developer": (d.get("developers") or [None])[0],
         "publisher": (d.get("publishers") or [None])[0],
     }
+
+
+def age_gated(ours: str, url: str) -> bool:
+    """With the gate recipe off, does Steam send this URL to the age check?"""
+    _status, _h, body, _s = post(ours.rstrip("/") + "/v1/fetch", {"url": url, "include": [], "resolveGates": False})
+    try:
+        return json.loads(body).get("outcome") == "age_gate"
+    except (ValueError, AttributeError):
+        return False
 
 
 def same(field: str, got, want) -> bool:
@@ -121,10 +146,10 @@ def main() -> None:
     ap.add_argument("--string", action="store_true")
     ap.add_argument("--out", default="bench/steam_accuracy.jsonl")
     a = ap.parse_args()
-    tot = {"ours": [0, 0], "string": [0, 0]}
+    rows = []
     with open(a.out, "w", encoding="utf-8") as fh:
         for appid, slug in GAMES.items():
-            url = f"https://store.steampowered.com/app/{appid}/{slug}/"
+            url = f"https://store.steampowered.com/app/{appid}/{slug}/?cc=us"
             truth = truth_for(a.ours, appid)
             if truth is None:
                 print(f"skip {appid}: no ground truth")
@@ -137,25 +162,30 @@ def main() -> None:
                    "oursServerMs": (env.get("timing") or {}).get("totalMs"),
                    "oursRequestId": h.get("x-request-id"), "oursSecs": round(secs, 3),
                    "oursSources": (env.get("extracted") or {}).get("sources"),
-                   "gated": any(g.get("kind") == "age_gate" for g in env.get("gates") or [] if g.get("trigger") != "preset")}
+                   "gated": age_gated(a.ours, url)}
             row["oursCorrect"] = {f: same(f, got.get(f), truth[f]) for f in FIELDS}
-            tot["ours"][0] += sum(row["oursCorrect"].values())
-            tot["ours"][1] += len(FIELDS)
             if a.string:
                 s_status, sh, sbody, ssecs = post("https://request.usestring.ai/v1/fetch", {"url": url, "format": "markdown"})
                 text = sbody.decode("utf-8", "replace")
                 row.update({"stringFinalUrl": sh.get("x-final-url"), "stringRequestId": sh.get("x-request-id"),
                             "stringSecs": round(ssecs, 3), "stringHttp": s_status})
                 row["stringContains"] = {f: appears(f, text, truth[f]) for f in FIELDS}
-                tot["string"][0] += sum(row["stringContains"].values())
-                tot["string"][1] += len(FIELDS)
+            rows.append(row)
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             print(f"{appid:>8} ours={sum(row['oursCorrect'].values())}/{len(FIELDS)} "
                   + (f"string-ceiling={sum(row['stringContains'].values())}/{len(FIELDS)} " if a.string else "")
-                  + f"{row['oursOutcome']} {url}", flush=True)
-    for k, (ok, n) in tot.items():
-        if n:
-            print(f"{k}: {ok}/{n} fields = {100 * ok / n:.1f}%")
+                  + f"{'gated  ' if row['gated'] else 'ungated'} {row['oursOutcome']} {url}", flush=True)
+    groups = {"all": rows, "age-gated": [r for r in rows if r["gated"]], "ungated": [r for r in rows if not r["gated"]]}
+    for name, rs in groups.items():
+        n = len(FIELDS) * len(rs)
+        if not n:
+            continue
+        ok = sum(sum(r["oursCorrect"].values()) for r in rs)
+        line = f"{name} ({len(rs)} games): ours {ok}/{n} = {100 * ok / n:.1f}%"
+        if a.string:
+            hit = sum(sum(r["stringContains"].values()) for r in rs)
+            line += f", string ceiling {hit}/{n} = {100 * hit / n:.1f}%"
+        print(line)
 
 
 if __name__ == "__main__":
