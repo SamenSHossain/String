@@ -33,7 +33,7 @@ from .gates import AGE_PATH_PATTERNS, CONSENT_PATH_PATTERNS, CONSENT_URL_PATTERN
 # quotes errors.edgesuite.net must not be mistaken for the interstitial itself.
 _TITLE_CHALLENGE = re.compile(r"<title>\s*just a moment\.\.\.\s*</title>")
 _STRONG = [
-    ("cloudflare", "challenge", re.compile(r"cf_chl_opt|cf-browser-verification|<div\b[^>]{0,300}?\bid=\"challenge-(form|running|stage)\"")),
+    ("cloudflare", "challenge", re.compile(r"cf_chl_opt|cf-browser-verification|<div\b[^<>]{0,300}?\bid=\"challenge-(form|running|stage)\"")),
     ("cloudflare", "blocked", re.compile(r"<title>\s*attention required! \| cloudflare\s*</title>")),
     ("datadome", "challenge", re.compile(r"geo\.captcha-delivery\.com|ct\.captcha-delivery\.com|interstitial\.captcha-delivery\.com")),
     ("perimeterx", "challenge", re.compile(r"px-captcha|_pxcaptcha|captcha\.px-cdn\.net|<title>\s*access to this page has been denied")),
@@ -46,6 +46,11 @@ _STRONG = [
     ("ddos-guard", "challenge", re.compile(r"check\.ddos-guard\.net|<title>\s*ddos-guard\s*</title>")),
     ("ozon", "blocked", re.compile(r"abt-challenge")),
     ("centinel", "challenge", re.compile(r"centinelanalytica\.com|window\.__centinel")),
+    # Amazon's robot check posts a captcha form here. Its anti-automation refusal (a 503
+    # "Sorry! Something went wrong!" dog page) carries no form, only this HTML comment.
+    # Both patterns need raw markup (a form tag, an unescaped "<!--"), not quoted prose.
+    ("amazon", "challenge", re.compile(r"""<form\b[^<>]{0,300}?\baction=["']?(https?://[^/"'<>\s]{1,100})?/errors/validatecaptcha""")),
+    ("amazon", "blocked", re.compile(r"<!--\s{0,100}to discuss automated access to amazon data")),
 ]
 # Scripts that many sites load on every page (Cloudflare's JS detections, reCAPTCHA v3):
 # only meaningful on a refusal or an almost empty page.
@@ -56,11 +61,16 @@ _WEAK = [
     ("generic", "blocked", re.compile(r"<title>\s*(access denied|forbidden|request blocked|403 forbidden)\s*</title>")),
 ]
 # Quantifiers are bounded on purpose: unbounded [^>]+ over 200 KB of hostile markup is
-# quadratic, and the regex engine holds the GIL while it runs.
-_ROOT_SHELL = re.compile(r"""<div\b[^>]{0,300}?\bid=["'](root|app|__next|__nuxt|main|application|svelte)["'][^>]{0,300}>\s{0,200}</div>""")
+# quadratic, and the regex engine holds the GIL while it runs. In-tag scans also stop at
+# "<", so the scans from consecutive "<div" starts never overlap ("<div" x 50,000 took
+# 0.3 s with [^>]{0,300}).
+_ROOT_SHELL = re.compile(r"""<div\b[^<>]{0,300}?\bid=["'](root|app|__next|__nuxt|main|application|svelte)["'][^<>]{0,300}>\s{0,200}</div>""")
 _JS_REQUIRED = re.compile(
     r"(enable|activate|turn on)\s+javascript|javascript\s+(is\s+)?(required|disabled|must be enabled)|"
-    r"requires\s+javascript|you need to enable javascript",
+    r"requires\s+javascript|you need to enable javascript|"
+    # Japanese: "JavaScriptが無効" (is disabled), "JavaScriptを有効に" (enable it); rakuten.co.jp's
+    # top page is such a notice (79 visible characters) over containers its scripts fill in
+    r"javascript\s*[がを]\s*(無効|有効)",
     re.I,
 )
 _JS_URL = re.compile(r"(javascript[_-]?(disabled|required)|/nojs|/no-js|enable[_-]?javascript)", re.I)
