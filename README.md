@@ -70,28 +70,33 @@ content any visitor gets after the click.
 
 ```
 POST /v1/fetch
-  └─ validate; SSRF guard (every hop resolved, private/loopback/link-local/CGNAT/metadata
-     refused, curl pinned to the checked IP with CURLOPT_RESOLVE)
+  └─ validate (jsonSchema at most 50 KB, 200 keys, depth 10); SSRF guard (every hop
+     resolved; private/loopback/link-local/CGNAT/metadata refused, IPv6 forms that embed an
+     IPv4 judged by that IPv4; curl pinned to the checked IP with CURLOPT_RESOLVE)
   └─ HTTP tier: curl_cffi with Chrome 152's TLS + HTTP/2 fingerprint; redirects followed by
-     hand; a cookie jar per request over a shared connection pool; caller's Authorization
-     and Cookie headers kept to the requested origin; decoded size capped in the write
-     callback
+     hand; a cookie jar per request over a shared connection pool; caller headers kept to
+     the requested origin (only Accept, Accept-Language, User-Agent, Cache-Control, Pragma,
+     DNT and Upgrade-Insecure-Requests go further); decoded size capped in the write callback
        └─ gate recipes: preset cookies, or act on the redirect / wall page
-  └─ decode like a browser (BOM > header > <meta> > UTF-8 > charset-normalizer; Shift_JIS
-     → cp932, GBK → GB18030, windows-1252 the WHATWG way)
+  └─ decode like a browser: BOM > header > <meta> > UTF-8 > the declared charset with
+     U+FFFD for a few bad bytes > charset-normalizer, with the WHATWG Encoding Standard's
+     labels and decoders
   └─ classify: ok | challenge | blocked | consent_wall | age_gate | login_wall |
      js_required | empty | rate_limited | not_found | http_error | server_error
        └─ challenge, block or rate limit? retry once with Safari's fingerprint
        └─ still failing, or a JS shell, an empty page or failed `expect` checks? headless
-          Chromium (patchright) in its own Modal app, started with the gate cookies; all of
-          its traffic goes through a local egress proxy that applies the same SSRF checks
-          to every connection, redirect hops included
+          Chromium (patchright) in its own Modal app, started with the gate cookies and only
+          the cross-origin-safe caller headers (Chromium carries headers across redirects);
+          all of its traffic goes through a local egress proxy that applies the same SSRF
+          checks to every connection, redirect hops included
   └─ caller's `expect` checks (contains / notContains / selector / minChars)
   └─ outputs: Markdown (Rust html-to-markdown; links absolutized; inline base64 images
-     reduced to alt text), main-content Markdown (trafilatura), text, html, raw, metadata,
-     JSON-LD, microdata, links, hydration data
-  └─ jsonSchema: filled from site extractors > the page's main entity (JSON-LD/microdata)
-     > page-level meta > other entities, every value with its source; null, never a guess
+     reduced to alt text), main-content Markdown (trafilatura; links resolved against the
+     page URL and <base href> first), text, html, raw, metadata, JSON-LD, microdata, links,
+     hydration data; a part that fails on a page is left out and named in `warnings`
+  └─ jsonSchema: filled from site extractors > the page's declared main entity
+     (JSON-LD/microdata) > page-level meta > other entities, every value with its source;
+     null, never a guess
 ```
 
 Code: [`webfetch/`](webfetch). Deployment: [`modal_app.py`](modal_app.py) (API) and
@@ -196,7 +201,7 @@ report `fetch, process, total`.
    `x-status-code: 200`. webfetch classifies every response (`outcome`: `ok`, `challenge`,
    `blocked`, `consent_wall`, `age_gate`, `login_wall`, `js_required`, `empty`,
    `rate_limited`, ...), names the vendor when known (Cloudflare, Akamai, DataDome,
-   PerimeterX, Imperva, AWS WAF, Centinel, ...) and answers `502` with the reason instead
+   PerimeterX, Imperva, AWS WAF, Centinel, Amazon, ...) and answers `502` with the reason instead
    of the wall's Markdown. Seen live: zeit.de (`challenge`, `centinel`), southwest.com's
    first response (`js_required`, escalated to the browser), and Hacker News' "Sorry,
    we're not able to serve your requests this quickly" page, which the first run received
@@ -206,10 +211,15 @@ report `fetch, process, total`.
    `ok`, and triggers the next strategy. String's `/fetch` has no equivalent parameter.
 4. **Structured output with provenance, nothing generated, about 1 ms.** String's
    `jsonSchema` extracts "with AI" for "a dynamic extraction fee". webfetch fills the
-   schema from what the page carries (site extractors, the main entity's JSON-LD/microdata,
-   page meta, other entities), resolves JSON-LD `@id` references, honours nullable
-   `anyOf`/`$ref` schemas as Pydantic emits them, returns `sources` per field, and returns
-   `null` plus `missing` instead of a guess.
+   schema from what the page carries (site extractors, the JSON-LD/microdata of the main
+   entity the page declares, page meta, other entities) and returns `sources` per field,
+   array items included (`recipeInstructions[0].text`), and `null` plus `missing` instead
+   of a guess. It resolves JSON-LD `@id` references, lists of them included (Yoast's
+   authors), and takes schemas as Pydantic emits them: nullable `anyOf`, `$ref`/`$defs`, a
+   root `$ref`, and self-referencing models (filled along the page's data, at most 12
+   levels deep). An `Optional` object the page does not carry is `null`, and identifiers
+   (SKU, MPN, GTIN, EAN, UPC, ISBN) are read only from their own keys, never from another
+   key or another entity on the page.
 5. **Escalation only when needed.** Plain HTTP with Chrome's TLS/HTTP2 fingerprint first;
    Safari's fingerprint on a challenge, block or rate limit; headless Chromium when the HTTP
    tier fails to fetch, or returns a challenge, block, rate limit, empty page or JavaScript
@@ -217,24 +227,42 @@ report `fetch, process, total`.
    `attempts: [http:chrome → js_required, browser:patchright → ok]`. `timeout` is one budget
    for all attempts.
 6. **Visible latency.** `server-timing`, `timing`, `redirects` (every hop, gate detours
-   included) and `attempts` (every strategy tried and why it was rejected).
+   and the browser's own redirects included) and `attempts` (every strategy tried and why
+   it was rejected).
 7. **Leaner Markdown.** Inline base64 images are reduced to their alt text: spiegel.de's
    Markdown went from 308,809 to about 143,000 characters, nu.nl's from 82,694 to 47,081
-   (first run vs this run, same converter otherwise). Relative links are absolutized.
-8. **Correct text on legacy encodings.** Browser-order charset detection with WHATWG
-   mappings (Shift_JIS → cp932, GB2312/GBK → GB18030, Big5 → Big5-HKSCS, EUC-KR → cp949,
-   windows-1252 decoded byte for byte) and a detector fallback when the declared charset is
-   wrong. `format: raw` returns the original bytes labelled with the detected charset.
+   (first run vs this run, same converter otherwise). Relative links and image sources are
+   resolved the way a browser resolves them (against the page URL and `<base href>`), in
+   both Markdown modes, in `links` and in microdata.
+8. **Correct text on legacy encodings.** The WHATWG Encoding Standard's label table and
+   decoders, as browsers use them: EUC-JP, Big5 (with HKSCS), Shift_JIS and EUC-KR decode
+   the web-platform-tests corpora exactly, single-byte encodings follow WHATWG's indexes,
+   and invalid bytes follow WHATWG's error rules. A declared charset is kept when only a
+   few bytes are invalid (shown as U+FFFD, as in browsers; `encodingSource` ends in
+   `-lossy`); when errors are pervasive, the declaration is taken to be wrong and a
+   detector decides. `format: raw` returns the original bytes with the origin's
+   `Content-Type`; when that names no charset, webfetch adds the one it decoded with, under
+   its browser name (`Shift_JIS`, `EUC-JP`, `windows-1252`, ...).
 9. **Safe to expose.**
    - Every connection is SSRF-checked: the HTTP tier's hops, gate callbacks, and in the
-     browser every request through the egress proxy.
-   - Caller credentials are not forwarded to other origins.
-   - Decoded size, parse size, nesting depth and concurrent analysis are bounded; patterns
-     that could backtrack are bounded.
+     browser every request through the egress proxy. IPv6 forms that embed an IPv4
+     (IPv4-mapped, -compatible and -translated, 6to4, Teredo, NAT64) are judged by that IPv4.
+   - Caller headers reach only the origin the caller named, except `Accept`,
+     `Accept-Language`, `User-Agent`, `Cache-Control`, `Pragma`, `DNT` and
+     `Upgrade-Insecure-Requests`. The browser tier cannot keep a header off a redirect
+     target, so it gets only those: a `Cookie` header becomes cookies for the requested
+     host, and the rest (`Authorization`, `X-Api-Key`, ...) are named in that attempt's
+     `droppedHeaders`.
+   - Decoded size, parse size, HTML and JSON nesting depth (page JSON nested deeper than
+     128 levels is skipped), schema size and depth, and concurrent analysis are bounded;
+     patterns that could backtrack are bounded.
+   - An unexpected error is a JSON `500` (`internal_error`, with its `requestId`), never a
+     bare one, and in a batch it fails only its own item.
    - Fetched pages are served with `Content-Security-Policy: sandbox`.
    - Browser renders cost 5 rate-limit tokens, at most 2 at a time per client.
 10. **Batch.** `POST /v1/batch`: up to 20 fetches per call, 5 at a time by default
-    (`concurrency` up to 10).
+    (`concurrency` up to 10). Each result carries `httpStatus`, the status `/v1/fetch`
+    would have answered for it as `format: json`.
 
 The code and this write-up went through an independent three-part review (security,
 correctness, and every claim checked against the data). Its 53 findings were fixed or, for
@@ -254,18 +282,26 @@ correctness review's findings".
 | `resolveGates` | default `true`; `false` leaves the wall in place and reports it (`502`; its content is included with `format: json`) |
 | `render` | `auto` (default: browser only after the HTTP tier fails, see §5.5), `never`, `always` (= `executeJS: true`) |
 | `cookies` | extra cookies for the target host |
+| `jsonSchema` | an object schema with `properties`, or a root `$ref` into `$defs`/`definitions` (what Pydantic emits for self-referencing models); at most 50 KB, 200 keys and nesting depth 10, else `400` |
 | `timeout`, `maxBytes` | budget for the whole request (≤ 90 s) and size cap (≤ 10 MB) |
 
 Fields String has and webfetch does not (`countryCode`, `method`/`body`, `actions`,
 `screenshot`, `captureXHR`, `solveCaptcha`, ...) are rejected with `400`.
 
-Response headers on every fetch: `x-request-id`, `x-status-code` (destination),
-`x-final-url`, `x-outcome`, `x-strategy`, `x-gates`, `server-timing`.
+Response headers: `x-request-id`, `x-outcome`, `x-final-url`, `x-strategy` and
+`server-timing` on every fetch (after a `fetch_error`, `x-final-url` is the last URL
+reached and `x-strategy` the last strategy tried); `x-status-code` whenever the destination
+answered, so not on a `fetch_error`; `x-gates` only when a gate recipe acted (the
+envelope's `gates` is `[]` otherwise); `x-encoding` with `format: raw`. The JSON envelope
+adds `warnings` (`[{part, message}]`) when a structured part could not be computed from
+the page, and a browser attempt lists the caller headers it did not send in
+`droppedHeaders`.
 
 Status codes: `200` means the destination's own answer (its status is in `statusCode`);
 `502` means we could not get past what the destination served, and `outcome` says what it
 was; `504` timeout; `400` invalid input; `403` destination not public (SSRF guard); `415`
-binary content requested as markdown/text/html; `429` rate limited.
+binary content requested as markdown/text/html (`ok: false`); `429` rate limited; `500`
+`internal_error`, a bug (the body carries the `requestId` to report).
 
 ## 7. Running it
 
@@ -300,8 +336,22 @@ Environment: `WEBFETCH_API_KEYS` (comma-separated; when set, every request needs
 - **Modal picks the region.** Containers run wherever Modal has capacity: the Nov 16
   benchmarks ran on a US container, and on Nov 17 the endpoint went out through Azure in
   Warsaw. Sites that localise by IP follow the container: Steam shows złoty there, and
-  GTA V has no age gate. There is no `countryCode`. `?cc=us` pins Steam, and Modal's
-  `region=` option on the functions (not set here) would pin the whole deployment.
+  GTA V has no age gate. There is no `countryCode`. `?cc=us` pins Steam's prices and age
+  rule, and Modal's `region=` option on the functions (not set here) would pin the whole
+  deployment. From a container in a country without the gate, Steam's `/agecheck/` sends
+  the visitor straight back, so with `resolveGates: false` the fetch loops between `/app/`
+  and `/agecheck/`; that loop is reported as `age_gate` (`502`) with every hop in
+  `redirects` (the default, with the recipe, is unaffected).
+- **The browser tier sends no credentials.** `Authorization`, API-key and other custom
+  headers would follow Chromium's redirects to other origins, so `render: always` does not
+  send them (see `droppedHeaders`); a `Cookie` header or the `cookies` field works, scoped
+  to the requested host.
+- **Some encodings are not WHATWG-exact.** GB18030 uses Python's codec, which differs from
+  WHATWG on 20 two-byte codes and on the byte 0x80; ISO-2022-JP/KR and HZ use Python's
+  codecs; a UTF-16 label without a byte-order mark is read as UTF-8.
+- **Readable mode is trafilatura's main-content extraction.** `mainContentOnly` /
+  `markdownMode: readable` drop asides and footnotes and can flatten code blocks nested in
+  lists; the default mode keeps the whole page.
 - **Extraction reads only what the page carries.** Fields that exist only as free text
   (not in JSON-LD, microdata, meta tags or a site extractor) come back `null`. An LLM
   fallback for those fields, with each value checked against the page text, is the

@@ -8,8 +8,10 @@ twice in a row is fine (the endpoint allows 30 requests/min per client IP).
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures as cf
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -24,8 +26,8 @@ from compare import CASES  # noqa: E402  (bench/ is on sys.path when run as a sc
 TARGETS = {url: markers for url, markers in CASES.items() if "zeit.de" not in url}
 
 
-def request(method: str, path: str, payload: dict | None = None, timeout: float = 150):
-    data = json.dumps(payload).encode() if payload is not None else None
+def request(method: str, path: str, payload: dict | None = None, timeout: float = 150, raw: bytes | None = None):
+    data = raw if raw is not None else (json.dumps(payload).encode() if payload is not None else None)
     for _ in range(4):
         req = urllib.request.Request(BASE + path, data=data, method=method,
                                      headers={"Content-Type": "application/json", "User-Agent": "webfetch-verify/1"})
@@ -57,6 +59,168 @@ def check(name: str, ok: bool, detail: str = "") -> bool:
     results.append((ok, name, detail))
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  ({detail})" if detail else ""), flush=True)
     return ok
+
+
+# Pydantic 2 model_json_schema() output for two self-referencing models:
+#   class Category(BaseModel): name: str; parent: Optional["Category"] = None
+#   class Page(BaseModel): title: str; category: Optional[Category] = None
+#   class Node(BaseModel): name: str; children: List["Node"] = []   (Pydantic puts this one behind a root $ref)
+CATEGORY = {"properties": {"name": {"title": "Name", "type": "string"},
+                           "parent": {"anyOf": [{"$ref": "#/$defs/Category"}, {"type": "null"}], "default": None}},
+            "required": ["name"], "title": "Category", "type": "object"}
+PAGE_SCHEMA = {"$defs": {"Category": CATEGORY}, "properties": {
+    "title": {"title": "Title", "type": "string"},
+    "category": {"anyOf": [{"$ref": "#/$defs/Category"}, {"type": "null"}], "default": None}},
+    "required": ["title"], "title": "Page", "type": "object"}
+NODE_SCHEMA = {"$defs": {"Node": {"properties": {
+    "name": {"title": "Name", "type": "string"},
+    "children": {"default": [], "items": {"$ref": "#/$defs/Node"}, "title": "Children", "type": "array"}},
+    "required": ["name"], "title": "Node", "type": "object"}}, "$ref": "#/$defs/Node"}
+
+# web-platform-tests encoding corpora: every character of the encoding in a <span data-cp="...">.
+WPT = "https://raw.githubusercontent.com/web-platform-tests/wpt/master/encoding/"
+SPAN = re.compile(r'<span data-cp="([0-9A-Fa-f]+)" data-bytes="[0-9A-Fa-f ]+">(.*?)</span>', re.S)
+MD_LINK = re.compile(r"\]\((https?://[^)\s]+)")
+
+
+def second_audit() -> None:
+    """The findings of the second audit, each checked where it was found."""
+    print("\nFixes from the second audit:")
+
+    deep = '{"type":"object","properties":{"a":' * 1200 + '{"type":"string"}' + "}}" * 1200
+    status, h, body, _s = request("POST", "/v1/fetch", raw=(
+        '{"url":"https://example.com/","include":[],"jsonSchema":' + deep + "}").encode())
+    env = parse_json(body)
+    check("jsonSchema nested 1,200 levels deep is a 400 validation_error, with x-request-id",
+          status == 400 and env.get("error") == "validation_error" and "x-request-id" in h,
+          f"{status} {env.get('error')} id={h.get('x-request-id')}")
+
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": "https://example.com/", "include": [],
+                                                        "jsonSchema": PAGE_SCHEMA})
+    ex = parse_json(body).get("extracted") or {}
+    d = ex.get("data") or {}
+    check("self-referencing Pydantic model: filled, and the Optional object the page lacks is null",
+          status == 200 and d.get("title") == "Example Domain" and d.get("category") is None
+          and "category" in (ex.get("missing") or []), f"{status} {d}")
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": "https://example.com/", "include": [],
+                                                        "jsonSchema": NODE_SCHEMA})
+    env = parse_json(body)
+    d = (env.get("extracted") or {}).get("data") or {}
+    check("Pydantic root $ref schema accepted and filled",
+          status == 200 and d.get("name") == "Example Domain" and not env.get("warnings"), f"{status} {d}")
+
+    # A header that is only for the requested origin must not follow a redirect to another one.
+    echo = "https://postman-echo.com/redirect-to?url=https://httpbin.org/headers"
+    sent = {"Authorization": "Bearer verify-dummy-1", "X-Api-Key": "verify-dummy-2", "Accept-Language": "nl-NL,nl;q=0.9"}
+    for render in ("never", "always"):
+        status, h, body, _s = request("POST", "/v1/fetch", {"url": echo, "headers": sent, "include": ["text"],
+                                                            "render": render})
+        env = parse_json(body)
+        text = env.get("text") or ""
+        dropped = sorted({x for a in env.get("attempts") or [] for x in a.get("droppedHeaders") or []})
+        reached = "httpbin.org" in text  # httpbin echoes the Host header it received
+        if render == "never":
+            ok = status == 200 and reached and "verify-dummy" not in text and "nl-NL" in text
+            detail = f"{status}; Accept-Language passed on: {'nl-NL' in text}"
+        else:
+            ok = (status == 200 and reached and "verify-dummy" not in text
+                  and (env.get("strategy") or "").startswith("browser")
+                  and {"authorization", "x-api-key"} <= set(dropped))
+            detail = f"{status} via {env.get('strategy')}; droppedHeaders={dropped}"
+        check(f"render {render}: Authorization and X-Api-Key never reach the redirect's other origin", ok,
+              detail + f"; leaked: {'verify-dummy' in text} id={h.get('x-request-id')}")
+
+    page = ('<html><head><title>Deep JSON-LD</title><script type="application/ld+json">' + "[" * 1100 + "]" * 1100
+            + "</script></head><body><p>This page's JSON-LD nests 1,100 levels deep.</p></body></html>")
+    url = "https://httpbin.org/base64/" + base64.urlsafe_b64encode(page.encode()).decode()
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": url, "include": ["jsonLd"], "render": "never"})
+    env = parse_json(body)
+    check("a page with JSON-LD nested 1,100 levels deep is served (the blob is skipped), not a 500",
+          status == 200 and env.get("ok") is True and env.get("jsonLd") == [],
+          f"{status} {env.get('outcome')} jsonLd={env.get('jsonLd')!r}")
+
+    for name, path, encoder_only in [
+            ("EUC-JP", "legacy-mb-japanese/euc-jp/eucjp_chars.html", {"A5", "203E", "2212"}),
+            ("Big5", "legacy-mb-tchinese/big5/big5_chars.html", set())]:
+        status, h, body, _s = request("POST", "/v1/fetch", {"url": WPT + path, "format": "html", "render": "never"})
+        spans = SPAN.findall(body.decode("utf-8", "replace"))
+        wrong = {cp.upper() for cp, ch in spans if ch != chr(int(cp, 16))}
+        # The only differences allowed are the spec's encoder-only entries (e.g. U+00A5 is encoded as 0x5C,
+        # but 0x5C decodes to "\").
+        check(f"{name}: the web-platform-tests corpus decodes as browsers do",
+              status == 200 and len(spans) > 10_000 and wrong == encoder_only,
+              f"{status}, {len(spans):,} characters, {len(wrong)} differ")
+
+    intro = "https://docs.python.org/3/tutorial/introduction.html"
+    _st, _h, full, _s = request("POST", "/v1/fetch", {"url": intro, "format": "markdown"})
+    status, h, readable, _s = request("POST", "/v1/fetch", {"url": intro, "format": "markdown", "mainContentOnly": True})
+    full_links = set(MD_LINK.findall(full.decode("utf-8", "replace")))
+    readable_links = set(MD_LINK.findall(readable.decode("utf-8", "replace")))
+    check("readable mode resolves relative links the way full mode does",
+          status == 200 and len(readable_links) >= 10 and readable_links <= full_links,
+          f"{len(readable_links)} links, {len(readable_links - full_links)} not among full mode's")
+
+    status, h, body, secs = request("POST", "/v1/fetch", {"url": "https://httpbin.org/delay/10", "timeout": 3,
+                                                          "render": "never"})
+    env = parse_json(body)
+    check("a fetch that times out is a 504 that still carries x-strategy and x-final-url",
+          status == 504 and env.get("error") == "timeout" and "x-strategy" in h and "x-final-url" in h,
+          f"{status} {env.get('error')} x-strategy={h.get('x-strategy')} in {secs:.1f}s")
+
+    status, h, body, _s = request("POST", "/v1/fetch", {
+        "url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf", "format": "markdown",
+        "render": "never"})
+    env = parse_json(body)
+    check("a PDF asked for as Markdown is a 415 with ok: false",
+          status == 415 and env.get("ok") is False and env.get("error") == "unsupported_content",
+          f"{status} ok={env.get('ok')} {env.get('error')}")
+
+    codes = [request("POST", "/v1/fetch", {"url": f"http://{host}/latest/meta-data/"})[0]
+             for host in ("[64:ff9b::a9fe:a9fe]", "[::ffff:0:a9fe:a9fe]", "[::7f00:1]")]
+    check("SSRF: IPv6 forms of private IPv4 addresses (NAT64, IPv4-translated, IPv4-compatible) refused",
+          codes == [403, 403, 403], str(codes))
+
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": "http://python.org/", "render": "always", "include": []})
+    env = parse_json(body)
+    hops = env.get("redirects") or []
+    check("browser-tier responses list their redirect hops",
+          status == 200 and (env.get("strategy") or "").startswith("browser") and len(hops) >= 1,
+          f"{status} via {env.get('strategy')}: {[(x.get('status'), x.get('url')) for x in hops]}")
+
+    status, h, body, _s = request("POST", "/v1/fetch", {
+        "url": "https://www.bbcgoodfood.com/recipes/easy-pancakes", "include": [],
+        "jsonSchema": {"type": "object", "properties": {
+            "name": {"type": "string"},
+            "recipeIngredient": {"type": "array", "items": {"type": "string"}},
+            "recipeInstructions": {"type": "array", "items": {"type": "object",
+                                                              "properties": {"text": {"type": "string"}}}}}}})
+    ex = parse_json(body).get("extracted") or {}
+    d = ex.get("data") or {}
+    check("recipe: the declared Recipe is the main entity, and array items carry their own sources",
+          status == 200 and d.get("name") == "Easy pancakes" and len(d.get("recipeIngredient") or []) >= 3
+          and any(k.startswith("recipeInstructions[0].") for k in ex.get("sources") or {}),
+          f"{status} name={d.get('name')!r}, {len(d.get('recipeInstructions') or [])} steps")
+
+    status, h, body, _s = request("POST", "/v1/fetch", {
+        "url": "https://techcrunch.com/2023/03/14/openai-releases-gpt-4-ai-that-it-claims-is-state-of-the-art/",
+        "include": [], "jsonSchema": {"type": "object", "properties": {
+            "headline": {"type": "string"},
+            "authors": {"type": "array", "items": {"type": "object", "properties": {
+                "name": {"type": "string"}, "url": {"type": "string"}}}}}}})
+    d = (parse_json(body).get("extracted") or {}).get("data") or {}
+    authors = d.get("authors") or [{}]
+    check("JSON-LD @id references in a list (Yoast authors) resolve to the person",
+          status == 200 and authors[0].get("name") == "Kyle Wiggers", f"{status} authors={authors}")
+
+    status, h, body, _s = request("POST", "/v1/fetch", {
+        "url": "https://www.gog.com/en/game/the_witcher_3_wild_hunt", "include": [],
+        "jsonSchema": {"type": "object", "properties": {"name": {"type": "string"}, "sku": {"type": "string"},
+                                                        "isbn": {"type": "string"}, "upc": {"type": "string"}}}})
+    ex = parse_json(body).get("extracted") or {}
+    d = ex.get("data") or {}
+    check("identifiers are never guessed: a game page has no ISBN or UPC",
+          status == 200 and "Witcher" in (d.get("name") or "") and d.get("isbn") is None and d.get("upc") is None
+          and {"isbn", "upc"} <= set(ex.get("missing") or []), f"{status} {d}")
 
 
 def main() -> int:
@@ -158,6 +322,8 @@ def main() -> int:
         codes = list(pool.map(one, urls))
     check(f"{len(urls)} concurrent requests", all(c == 200 for c in codes),
           f"{codes} in {time.monotonic() - t0:.1f}s")
+
+    second_audit()
 
     failed = [name for ok, name, _ in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
