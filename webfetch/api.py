@@ -11,15 +11,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from .config import Settings, load_settings
@@ -46,21 +49,44 @@ MAX_BATCH = 20
 BROWSER_COST = 5  # a headless-browser render uses ~5x the resources of an HTTP fetch
 
 
-def _schema_size(node: Any, depth: int = 0) -> tuple[int, int]:
-    """(number of keys, nesting depth) of a JSON value."""
-    if isinstance(node, dict):
-        keys, deepest = len(node), depth
-        for v in node.values():
-            k, d = _schema_size(v, depth + 1)
-            keys, deepest = keys + k, max(deepest, d)
-        return keys, deepest
-    if isinstance(node, list):
-        keys, deepest = 0, depth
-        for v in node:
-            k, d = _schema_size(v, depth + 1)
-            keys, deepest = keys + k, max(deepest, d)
-        return keys, deepest
-    return 0, depth
+def _schema_size(node: Any) -> tuple[int, int]:
+    """(number of keys, nesting depth) of a JSON value. An explicit stack, not recursion,
+    and it stops once a limit is passed: a schema nested 10,000 levels deep is a 400, not
+    a RecursionError."""
+    keys = deepest = 0
+    stack = [(node, 0)]
+    while stack and keys <= MAX_SCHEMA_KEYS and deepest <= MAX_SCHEMA_DEPTH:
+        cur, depth = stack.pop()
+        deepest = max(deepest, depth)
+        if isinstance(cur, dict):
+            keys += len(cur)
+            stack.extend((v, depth + 1) for v in cur.values())
+        elif isinstance(cur, list):
+            stack.extend((v, depth + 1) for v in cur)
+    return keys, deepest
+
+
+_DEFS_REF = re.compile(r"#/(\$defs|definitions)/([^/]+)")
+
+
+def _is_object_schema(node: Any) -> bool:
+    return isinstance(node, dict) and node.get("type") in ("object", None) and isinstance(node.get("properties"), dict)
+
+
+def _root_is_object(schema: dict) -> bool:
+    """The root is an object schema with "properties", itself or through a root "$ref"
+    into "$defs"/"definitions" (what Pydantic emits for a self-referencing model)."""
+    node: Any = schema
+    for _ in range(MAX_SCHEMA_DEPTH):  # a bounded chain of refs
+        if _is_object_schema(node):
+            return True
+        ref = node.get("$ref") if isinstance(node, dict) else None
+        m = _DEFS_REF.fullmatch(ref) if isinstance(ref, str) else None
+        defs = schema.get(m.group(1)) if m else None
+        if not isinstance(defs, dict):
+            return False
+        node = defs.get(m.group(2))
+    return False
 
 
 class ExpectModel(BaseModel):
@@ -129,14 +155,20 @@ class FetchBody(BaseModel):
     def _schema(cls, v):
         if v is None:
             return v
-        raw = json.dumps(v)
-        if len(raw) > MAX_SCHEMA_BYTES:
-            raise ValueError(f"jsonSchema is larger than {MAX_SCHEMA_BYTES} bytes")
-        if v.get("type") not in ("object", None) or not isinstance(v.get("properties"), dict):
-            raise ValueError('jsonSchema must be an object schema with "properties"')
+        # Keys and depth first, with the iterative walk: nothing recursive (json.dumps here,
+        # the schema filler later) may see a deeply nested schema.
         keys, depth = _schema_size(v)
         if keys > MAX_SCHEMA_KEYS or depth > MAX_SCHEMA_DEPTH:
             raise ValueError(f"jsonSchema is limited to {MAX_SCHEMA_KEYS} keys and nesting depth {MAX_SCHEMA_DEPTH}")
+        try:
+            raw = json.dumps(v)
+        except RecursionError as exc:  # pydantic turns ValueError, not RecursionError, into a 400
+            raise ValueError("jsonSchema nests too deeply") from exc
+        if len(raw) > MAX_SCHEMA_BYTES:
+            raise ValueError(f"jsonSchema is larger than {MAX_SCHEMA_BYTES} bytes")
+        if not _root_is_object(v):
+            raise ValueError('jsonSchema must be an object schema with "properties" '
+                             '(or a root "$ref" to one in "$defs")')
         return v
 
     def to_options(self) -> FetchOptions:
@@ -215,6 +247,19 @@ def _error(status: int, error: str, message: str, rid: str, **extra) -> JSONResp
                         headers={"x-request-id": rid})
 
 
+def _security_headers(path: str) -> dict[str, str]:
+    if not path.startswith("/v1/"):
+        return {}
+    # Fetched pages are third-party content: never let them run on this origin.
+    return {"content-security-policy": "sandbox; default-src 'none'", "x-content-type-options": "nosniff",
+            "x-frame-options": "DENY"}
+
+
+def _internal_message(exc: BaseException) -> str:
+    # The class only: an exception's text can hold URLs, header values or paths.
+    return f"the service failed on this request ({type(exc).__name__}); quote the requestId when reporting it"
+
+
 def _server_timing(t: dict) -> str:
     parts = []
     for key, name in (("dnsMs", "dns"), ("connectMs", "connect"), ("tlsMs", "tls"), ("ttfbMs", "ttfb"),
@@ -253,6 +298,27 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
                   for e in exc.errors()]
         return _error(400, "validation_error", issues[0]["message"] if issues else "invalid request", rid, issues=issues)
 
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException):
+        # FastAPI's own 400 for a body it cannot parse (e.g. JSON nested past the parser's
+        # limit) in the same shape as every other invalid request; 404/405 stay as they are.
+        if exc.status_code != 400:
+            return await http_exception_handler(request, exc)
+        rid = getattr(request.state, "rid", None) or str(uuid.uuid4())
+        return _error(400, "validation_error", str(exc.detail), rid)
+
+    @app.exception_handler(Exception)
+    async def _internal(request: Request, exc: Exception):
+        # Anything unexpected is a JSON 500 that can be traced, never Starlette's plain-text
+        # one. Starlette runs this handler outside the middleware below, so the headers
+        # that middleware adds are set here.
+        rid = getattr(request.state, "rid", None) or str(uuid.uuid4())
+        log.error(json.dumps({"rid": rid, "path": request.url.path, "status": 500, "error": type(exc).__name__}),
+                  exc_info=exc)
+        resp = _error(500, "internal_error", _internal_message(exc), rid)
+        resp.headers.update(_security_headers(request.url.path))
+        return resp
+
     @app.middleware("http")
     async def _request_id(request: Request, call_next):
         rid = str(uuid.uuid4())
@@ -262,11 +328,7 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
         ms = round((time.monotonic() - t0) * 1000, 1)
         response.headers["x-request-id"] = rid
         response.headers["x-request-duration-ms"] = str(ms)
-        if request.url.path.startswith("/v1/"):
-            # Fetched pages are third-party content: never let them run on this origin.
-            response.headers["content-security-policy"] = "sandbox; default-src 'none'"
-            response.headers["x-content-type-options"] = "nosniff"
-            response.headers["x-frame-options"] = "DENY"
+        response.headers.update(_security_headers(request.url.path))
         if request.url.path.startswith("/v1/"):
             log.info(json.dumps({"rid": rid, "path": request.url.path, "status": response.status_code,
                                  "outcome": response.headers.get("x-outcome"), "ms": ms}))
@@ -326,7 +388,7 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
             status = 504 if env.get("error") == "timeout" else 502
             return JSONResponse(env, status_code=status, headers=hdrs)
         if env.pop("_unsupported", False) and body.format in ("markdown", "text", "html"):
-            env.update({"error": "unsupported_content",
+            env.update({"ok": False, "error": "unsupported_content",
                         "message": f"{env.get('contentType') or 'this content'} cannot be returned as {body.format}; "
                                    "use format raw or json"})
             return JSONResponse(env, status_code=415, headers=hdrs)
@@ -411,10 +473,23 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
                 if item.format != "json":
                     item = item.model_copy(update={"format": "json"})
                 resp = await _do_fetch(item, f"{rid}:{i}", _client_id(request))
-                return json.loads(resp.body)
+                # The status /v1/fetch would have answered for this item.
+                return {"httpStatus": resp.status_code, **json.loads(resp.body)}
 
         t0 = time.monotonic()
-        results = await asyncio.gather(*(one(i, r) for i, r in enumerate(body.requests)))
+        # An item that raises is that item's internal_error, not the whole batch's.
+        settled = await asyncio.gather(*(one(i, r) for i, r in enumerate(body.requests)), return_exceptions=True)
+        results = []
+        for i, (item, res) in enumerate(zip(body.requests, settled)):
+            if isinstance(res, BaseException):
+                if not isinstance(res, Exception):
+                    raise res  # cancellation, interpreter exit
+                log.error(json.dumps({"rid": f"{rid}:{i}", "path": request.url.path, "status": 500,
+                                      "error": type(res).__name__}), exc_info=res)
+                res = {"httpStatus": 500, "error": "internal_error", "message": _internal_message(res),
+                       "requestId": f"{rid}:{i}"}
+            res.setdefault("url", item.url)  # error items say which request they answer
+            results.append(res)
         return JSONResponse({"requestId": rid, "ms": round((time.monotonic() - t0) * 1000, 1),
                              "results": results}, headers={"x-request-id": rid})
 

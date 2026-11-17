@@ -7,13 +7,14 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from . import extract
 from .classify import Verdict, classify
 from .decode import decode_body
-from .fetcher import FetchError, FetchResult, HttpFetcher
-from .gates import GateEvent, presets_for
-from .netguard import normalize_url
+from .fetcher import FetchError, FetchResult, Hop, HttpFetcher
+from .gates import AGE_PATH_PATTERNS, CONSENT_PATH_PATTERNS, CONSENT_URL_PATTERNS, GateEvent, presets_for
+from .netguard import CROSS_ORIGIN_SAFE_HEADERS, cross_origin_headers, normalize_url
 from .schema_fill import build_candidates, fill_schema, site_candidates
 
 JSON_INCLUDES = {"markdown", "html", "text", "metadata", "jsonLd", "microdata", "links", "hydration"}
@@ -198,17 +199,43 @@ def _browser_cookies(url: str, extra: dict[str, str] | None, resolve_gates: bool
     return cookies
 
 
+def _header_cookies(headers: dict[str, str] | None) -> dict[str, str]:
+    """The caller's Cookie header as name -> value."""
+    out: dict[str, str] = {}
+    for key, value in (headers or {}).items():
+        if key.lower() == "cookie":
+            for pair in value.split(";"):
+                name, sep, val = pair.partition("=")
+                if sep and name.strip():
+                    out[name.strip()] = val.strip()
+    return out
+
+
+def _dropped_headers(headers: dict[str, str] | None) -> list[str]:
+    """Caller headers the browser tier does not send. Chromium carries request headers
+    across a redirect to another origin, so origin-bound ones (Authorization, API keys,
+    custom headers) stay out of it; the Cookie header goes in as host-scoped cookies."""
+    names = (k.lower() for k in headers or {})
+    return list(dict.fromkeys(n for n in names if n not in CROSS_ORIGIN_SAFE_HEADERS and n != "cookie"))
+
+
 def _browser_result(url: str, data: dict[str, Any], gates: list[GateEvent]) -> FetchResult:
     html = data.get("html") or ""
+    final_url = data.get("finalUrl") or url
+    status = int(data.get("status") or 0)
+    # The redirects Chromium followed, then the page itself (the envelope lists all but it).
+    hops = [Hop(str(h.get("url") or ""), int(h.get("status") or 0), h.get("location"), float(h.get("ms") or 0.0))
+            for h in data.get("redirects") or [] if isinstance(h, dict)]
+    hops.append(Hop(final_url, status, None, 0.0))
     return FetchResult(
         requested_url=normalize_url(url).url,
-        final_url=data.get("finalUrl") or url,
-        status=int(data.get("status") or 0),
+        final_url=final_url,
+        status=status,
         headers={k.lower(): v for k, v in (data.get("headers") or {}).items()},
         body=html.encode("utf-8"),
         http_version=str(data.get("httpVersion") or ""),
         remote_ip=data.get("remoteIp") or "",
-        hops=[],
+        hops=hops,
         gates=gates,
         timing={"fetchMs": float(data.get("ms") or 0.0)},
         strategy=data.get("strategy") or "browser:chromium",
@@ -217,6 +244,22 @@ def _browser_result(url: str, data: dict[str, Any], gates: list[GateEvent]) -> F
 
 
 MIN_ESCALATION_SECONDS = 2.0
+
+
+def _wall_in_redirect_loop(err: FetchError) -> tuple[str, str] | None:
+    """(outcome, reason) when the redirects that ran out pass through an age check or a
+    consent page: the destination sends every visitor there and back without serving the
+    page (Steam does this between /app/ and /agecheck/ in regions without the age rule)."""
+    if err.code != "too_many_redirects":
+        return None
+    for hop in err.hops[1:]:  # detours only: the requested URL itself may match a pattern
+        parts = urlsplit(hop.url)
+        host = (parts.hostname or "").lower()
+        if AGE_PATH_PATTERNS.search(parts.path):
+            return "age_gate", f"destination keeps redirecting to its age check ({parts.path})"
+        if CONSENT_URL_PATTERNS.search(host) or CONSENT_PATH_PATTERNS.search(parts.path):
+            return "consent_wall", f"destination keeps redirecting to its consent page ({host}{parts.path})"
+    return None
 
 
 async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserClient | None) -> dict[str, Any]:
@@ -230,25 +273,26 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
     attempts: list[dict] = []
     best: Page | None = None
     last_error: FetchError | None = None
+    last_error_strategy = ""
 
     async def http_attempt(impersonate: str | None) -> Page | None:
-        nonlocal last_error
+        nonlocal last_error, last_error_strategy
         a0 = time.monotonic()
+        strategy = f"http:{impersonate or fetcher.settings.impersonate}"
         try:
             res = await fetcher.fetch(
                 opts.url, headers=opts.headers, cookies=opts.cookies, timeout=max(left(), 0.5),
                 resolve_gates=opts.resolve_gates, max_bytes=opts.max_bytes, impersonate=impersonate,
             )
         except FetchError as exc:
-            last_error = exc
-            attempts.append({"strategy": f"http:{impersonate or fetcher.settings.impersonate}",
-                             "error": exc.code, "message": exc.message,
+            last_error, last_error_strategy = exc, strategy
+            attempts.append({"strategy": strategy, "error": exc.code, "message": exc.message,
                              "ms": round((time.monotonic() - a0) * 1000, 1)})
             return None
         try:
             page = await _bounded(_analyze, res, opts.expect)
         except TooComplex as exc:
-            last_error = FetchError("too_complex", str(exc))
+            last_error, last_error_strategy = FetchError("too_complex", str(exc)), res.strategy
             attempts.append({"strategy": res.strategy, "error": "too_complex", "message": str(exc),
                              "ms": round((time.monotonic() - a0) * 1000, 1)})
             return None
@@ -266,17 +310,22 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
                              "message": f"at most {MAX_BROWSER_PER_CLIENT} concurrent browser renders per client",
                              "ms": 0.0})
             return None
+        # Only cross-origin-safe headers go to the browser; a Cookie header becomes cookies
+        # for the requested host (the cookies field wins a name clash).
+        dropped = _dropped_headers(opts.headers)
+        note = {"droppedHeaders": dropped} if dropped else {}
+        cookies = {**_header_cookies(opts.headers), **(opts.cookies or {})}
         _active_renders[opts.client] = _active_renders.get(opts.client, 0) + 1
         try:
             data = await asyncio.wait_for(browser.render(
                 normalize_url(opts.url).url,
-                cookies=_browser_cookies(opts.url, opts.cookies, opts.resolve_gates),
-                headers=opts.headers, timeout=max(left() - 1.0, 1.0),
+                cookies=_browser_cookies(opts.url, cookies, opts.resolve_gates),
+                headers=cross_origin_headers(opts.headers) or None, timeout=max(left() - 1.0, 1.0),
                 max_bytes=opts.max_bytes or fetcher.settings.max_bytes,
             ), timeout=max(left(), 1.0))
         except Exception as exc:  # browser tier is best effort
             attempts.append({"strategy": "browser:chromium", "error": "browser_error",
-                             "message": str(exc)[:300], "ms": round((time.monotonic() - a0) * 1000, 1)})
+                             "message": str(exc)[:300], "ms": round((time.monotonic() - a0) * 1000, 1), **note})
             return None
         finally:
             _active_renders[opts.client] -= 1
@@ -285,7 +334,7 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
         if data.get("error"):
             attempts.append({"strategy": "browser:chromium", "error": data.get("error"),
                              "message": str(data.get("message", ""))[:300],
-                             "ms": round((time.monotonic() - a0) * 1000, 1)})
+                             "ms": round((time.monotonic() - a0) * 1000, 1), **note})
             return None
         gates = []
         if opts.resolve_gates:
@@ -296,11 +345,11 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
             page = await _bounded(_analyze, res, opts.expect)
         except TooComplex as exc:
             attempts.append({"strategy": res.strategy, "error": "too_complex", "message": str(exc),
-                             "ms": round((time.monotonic() - a0) * 1000, 1)})
+                             "ms": round((time.monotonic() - a0) * 1000, 1), **note})
             return None
         attempts.append({"strategy": res.strategy, "outcome": page.verdict.outcome, "statusCode": res.status,
                          "ms": round((time.monotonic() - a0) * 1000, 1),
-                         **({"validationPassed": page.validation["passed"]} if page.validation else {})})
+                         **({"validationPassed": page.validation["passed"]} if page.validation else {}), **note})
         return page
 
     if opts.render == "always" and browser is not None:
@@ -327,9 +376,22 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
     total_ms = round((time.monotonic() - t0) * 1000, 1)
     if best is None:
         err = last_error or FetchError("fetch_error", "the page could not be fetched")
+        wall = _wall_in_redirect_loop(err)
+        if wall is not None:
+            last = err.hops[-1]
+            return {
+                "ok": False, "outcome": wall[0], "reason": wall[1], "vendor": None,
+                "url": normalize_url(opts.url).url, "finalUrl": last.url, "statusCode": last.status,
+                "strategy": last_error_strategy, "gates": [g.as_dict() for g in err.gates],
+                "redirects": [h.as_dict() for h in err.hops], "attempts": attempts,
+                "timing": {"totalMs": total_ms},
+            }
         return {
             "ok": False, "outcome": "fetch_error", "error": err.code, "reason": err.message,
-            "url": opts.url, "attempts": attempts,
+            # No destination answer, so no statusCode; how far it got, and with what:
+            "url": opts.url, "finalUrl": err.hops[-1].url if err.hops else normalize_url(opts.url).url,
+            "strategy": attempts[-1]["strategy"] if attempts else None,
+            "attempts": attempts,
             "gates": [g.as_dict() for g in err.gates],
             "redirects": [h.as_dict() for h in err.hops],
             "timing": {"totalMs": total_ms},
@@ -380,28 +442,32 @@ def _render_outputs(page: Page, opts: FetchOptions) -> dict[str, Any]:
             env["markdown"] = extract.to_markdown(page.text, base, opts.markdown_mode)
         if fmt == "text" or "text" in want:
             env["text"] = extract.to_text(page.text)
-        meta = None
-        if "metadata" in want or opts.json_schema:
-            meta = extract.page_metadata(page.tree, base)
-            if "metadata" in want:
-                env["metadata"] = meta
-        ld = extract.json_ld(page.tree) if ("jsonLd" in want or opts.json_schema) else []
-        md = extract.microdata(page.tree, base) if ("microdata" in want or opts.json_schema) else []
-        if "jsonLd" in want:
-            env["jsonLd"] = ld
-        if "microdata" in want:
-            env["microdata"] = md
+
+        def part(name: str, fn, *args, keep: bool):
+            """One structured part, computed in isolation: if it fails (say, JSON-LD nested
+            10,000 levels deep), the response is served without it and a warning says why."""
+            try:
+                value = fn(*args)
+            except Exception as exc:
+                env.setdefault("warnings", []).append({"part": name, "message": f"{type(exc).__name__}: {exc}"[:300]})
+                return None
+            if keep:
+                env[name] = value
+            return value
+
+        meta = part("metadata", extract.page_metadata, page.tree, base, keep="metadata" in want) \
+            if "metadata" in want or opts.json_schema else None
+        ld = part("jsonLd", extract.json_ld, page.tree, keep="jsonLd" in want) \
+            if "jsonLd" in want or opts.json_schema else []
+        md = part("microdata", extract.microdata, page.tree, base, keep="microdata" in want) \
+            if "microdata" in want or opts.json_schema else []
         if "links" in want:
-            env["links"] = extract.links(page.tree, base)
+            part("links", extract.links, page.tree, base, keep=True)
         if "hydration" in want:
-            env["hydration"] = extract.hydration_data(page.tree)
+            part("hydration", extract.hydration_data, page.tree, keep=True)
         if opts.json_schema:
-            t = time.monotonic()
-            cands = build_candidates(jsonld=ld, microdata=md, metadata=meta or {},
-                                     site=site_candidates(page.tree, base))
-            filled = fill_schema(opts.json_schema, cands, base)
-            filled["ms"] = round((time.monotonic() - t) * 1000, 2)
-            env["extracted"] = filled
+            # A part that failed above is simply not a source here.
+            part("extracted", _fill, page, opts.json_schema, ld or [], md or [], meta or {}, base, keep=True)
     elif _is_textual(page.content_type):
         if fmt == "markdown" or "markdown" in want:
             env["markdown"] = page.text
@@ -414,6 +480,14 @@ def _render_outputs(page: Page, opts: FetchOptions) -> dict[str, Any]:
     if fmt == "raw":
         env["_raw"] = r.body  # popped by the API layer; never serialized
     return env
+
+
+def _fill(page: Page, schema: dict, ld: list, md: list, meta: dict, base: str) -> dict[str, Any]:
+    t = time.monotonic()
+    cands = build_candidates(jsonld=ld, microdata=md, metadata=meta, site=site_candidates(page.tree, base))
+    filled = fill_schema(schema, cands, base)
+    filled["ms"] = round((time.monotonic() - t) * 1000, 2)
+    return filled
 
 
 def _is_textual(content_type: str) -> bool:

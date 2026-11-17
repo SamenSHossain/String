@@ -7,6 +7,7 @@ code paths that run in production.
 
 from __future__ import annotations
 
+import sys
 import threading
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -86,7 +87,28 @@ class Handler(BaseHTTPRequestHandler):
         self.server.seen.append({"host": host, "path": self.path, "cookies": cookies,
                                  "ua": self.headers.get("User-Agent", "")})
 
+        # Routes that answer on every host (tests point any name at this server).
+        if path == "/echo-headers":
+            import html as _html
+            import json as _json
+            # A header sent twice shows as "first, second".
+            seen = _json.dumps({k.lower(): ", ".join(self.headers.get_all(k)) for k in self.headers}, sort_keys=True)
+            return self._send(200, f"<html><head><title>Headers</title></head><body><pre id='h'>{_html.escape(seen)}"
+                                   "</pre></body></html>")
+        if path == "/redirect-to":
+            return self._send(int(qs.get("status", ["302"])[0]), headers={"Location": qs["url"][0]})
+        if path == "/two-hops":
+            return self._send(302, headers={"Location": "/two-hops/next"})
+        if path == "/two-hops/next":
+            return self._send(301, headers={"Location": "/echo-headers"})
+
         if host == "store.steampowered.com":
+            # From a region without the age rule, Steam bounces between the app page and the
+            # age check forever (for any client, browsers included).
+            if path.startswith("/app/1174180"):
+                return self._send(302, headers={"Location": f"http://store.steampowered.com:{port}/agecheck/app/1174180/"})
+            if path.startswith("/agecheck/app/1174180"):
+                return self._send(302, headers={"Location": f"http://store.steampowered.com:{port}/app/1174180/"})
             if path.startswith("/app/271590"):
                 if cookies.get("birthtime") and cookies.get("wants_mature_content") == "1":
                     return self._send(200, STEAM_PAGE)
@@ -119,6 +141,12 @@ class Handler(BaseHTTPRequestHandler):
                                        + "IT-News für Profis. " * 40 + "</p></body></html>")
             back = quote(f"http://www.golem.de:{port}{path}", safe="")
             return self._send(302, headers={"Location": f"/sonstiges/zustimmung/auswahl.html?from={back}"})
+
+        if host == "news.consent-loop.test":
+            # A consent page that sends the visitor back, which sends them to it again.
+            if path.startswith("/consent/"):
+                return self._send(302, headers={"Location": "/"})
+            return self._send(302, headers={"Location": "/consent/?return=%2F"})
 
         if host == "www.zeit.de":
             if path.startswith("/zustimmung"):
@@ -212,9 +240,17 @@ PRODUCT_PAGE = """<!DOCTYPE html><html lang="en"><head><title>Acme Anvil | Acme 
 </head><body><h1>Acme Anvil 50kg</h1><p>""" + ("Forged steel. " * 50) + """</p></body></html>"""
 
 
+class _Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # A client hanging up (a timed-out /slow request, a browser shutting down) is not a
+        # server bug; anything else is still printed.
+        if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            super().handle_error(request, client_address)
+
+
 @pytest.fixture(scope="session")
 def server():
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv = _Server(("127.0.0.1", 0), Handler)
     srv.seen = []
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()

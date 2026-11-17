@@ -12,6 +12,7 @@ import time
 from urllib.parse import urlsplit
 
 from .egress import EgressProxy
+from .netguard import cross_origin_headers
 
 # DOM markers of interstitials that finish by reloading the page. DOM-only on purpose:
 # patchright evaluates in an isolated world where page globals are not visible.
@@ -22,6 +23,24 @@ QUIET_SECONDS = 2.5
 CHALLENGE_TITLES = ("just a moment", "attention required", "please wait", "checking your browser",
                     "one moment", "verifying you are human", "pardon our interruption")
 BLOCKED_RESOURCES = {"image", "media", "font"}
+MAX_REPORTED_REDIRECTS = 30  # Chromium itself gives up after 20
+
+
+async def _redirect_chain(resp) -> list[dict]:
+    """The redirects Chromium followed to reach ``resp``, first hop first."""
+    hops: list[dict] = []
+    try:
+        req = resp.request.redirected_from if resp is not None else None
+        while req is not None and len(hops) < MAX_REPORTED_REDIRECTS:
+            r = await req.response()
+            end = (req.timing or {}).get("responseEnd", -1)  # ms after the request started
+            hops.append({"url": req.url, "status": r.status if r is not None else 0,
+                         "location": r.headers.get("location") if r is not None else None,
+                         "ms": round(end, 1) if end and end > 0 else 0.0})
+            req = req.redirected_from
+    except Exception:  # reporting hops must never cost the page
+        pass
+    return hops[::-1]
 
 
 class BrowserPool:
@@ -74,6 +93,11 @@ class BrowserPool:
                      max_bytes: int = 10 * 1024 * 1024) -> dict:
         t0 = time.monotonic()
         deadline = t0 + timeout
+        # Chromium carries headers set in the route handler across redirects without calling
+        # the handler again, so an origin-bound header (Authorization, Cookie, API keys)
+        # handed to it could reach another origin: only cross-origin-safe ones are used, also
+        # when a caller over RPC sends more. Lower-cased: they replace Chromium's own values.
+        headers = {k.lower(): v for k, v in cross_origin_headers(headers).items()}
         await self.start()
         ctx = await self._browser.new_context(
             locale="en-US", timezone_id="America/New_York", viewport={"width": 1366, "height": 900},
@@ -89,7 +113,7 @@ class BrowserPool:
                 req = route.request
                 if req.resource_type in BLOCKED_RESOURCES:
                     return await route.abort()
-                # Caller headers (auth, cookies) only go to the origin the caller named.
+                # The caller's (cross-origin-safe) headers go on requests to the named origin.
                 if headers and urlsplit(req.url)[:2] == origin:
                     return await route.continue_(headers={**req.headers, **headers})
                 await route.continue_()
@@ -142,6 +166,7 @@ class BrowserPool:
                 "status": status,
                 "headers": hdrs,
                 "html": html,
+                "redirects": await _redirect_chain(resp),
                 "ms": round((time.monotonic() - t0) * 1000, 1),
                 "strategy": f"browser:{self.engine}",
             }

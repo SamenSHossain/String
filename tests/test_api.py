@@ -136,7 +136,7 @@ def test_raw_keeps_original_bytes_and_labels_their_charset(server, client):
 def test_binary_as_markdown_is_415(server, client):
     port = server.server_address[1]
     r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/doc.pdf", "format": "markdown"})
-    assert r.status_code == 415 and r.json()["error"] == "unsupported_content"
+    assert r.status_code == 415 and r.json()["error"] == "unsupported_content" and r.json()["ok"] is False
     r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/doc.pdf", "format": "raw"})
     assert r.status_code == 200 and r.content.startswith(b"%PDF")
 

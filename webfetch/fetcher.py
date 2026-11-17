@@ -18,13 +18,11 @@ from curl_cffi.requests.exceptions import RequestException
 
 from .config import Settings
 from .gates import GateEvent, check_response, presets_for
-from .netguard import BlockedDestination, InvalidUrl, ip_is_public, normalize_url, resolve_public
+from .netguard import BlockedDestination, InvalidUrl, cross_origin_headers, ip_is_public, normalize_url, resolve_public
 
 _REDIRECT = {301, 302, 303, 307, 308}
 _META_TAG = re.compile(rb"<meta\b[^>]{0,1024}>", re.I)  # bounded: linear on hostile input
 _REFRESH_URL = re.compile(rb"""content\s*=\s*["']?\s*(\d{1,4})\s*[;,]\s*url\s*=\s*['"]?([^"'>\s]{1,2048})""", re.I)
-# Sent on hops to other origins only if the caller did not set them (as curl and requests do).
-_ORIGIN_BOUND_HEADERS = {"authorization", "cookie", "proxy-authorization"}
 
 
 def _strip_noscript(html: bytes) -> bytes:
@@ -215,10 +213,11 @@ class HttpFetcher:
                 # Per-hop options (DNS pin, size cap). The session belongs to this request
                 # only, so replacing its option dict between hops is safe.
                 session.curl_options = curl_options
+                # Caller headers go in full only to the origin the caller named; other
+                # origins (redirect targets, gate callbacks) get the allowlisted ones.
                 same_origin = (hop_target.scheme, hop_target.host, hop_target.port) == \
                     (target.scheme, target.host, target.port)
-                hop_headers = headers if same_origin or not headers else \
-                    {k: v for k, v in headers.items() if k.lower() not in _ORIGIN_BOUND_HEADERS}
+                hop_headers = headers if same_origin else cross_origin_headers(headers)
                 # Collect the body ourselves: libcurl hands the write callback *decoded*
                 # bytes, so the size cap also stops gzip/brotli decompression bombs, which
                 # CURLOPT_MAXFILESIZE (checked on the wire) does not.

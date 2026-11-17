@@ -17,6 +17,16 @@ from urllib.parse import quote, urlsplit, urlunsplit
 MAX_URL_LENGTH = 8192
 BLOCKED_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".intranet")
 BLOCKED_HOSTS = {"localhost", "metadata", "metadata.google.internal", "instance-data"}
+# Caller headers that may reach any origin: they describe the client, not who it is.
+# Every other caller header (Authorization, Cookie, X-Api-Key, any custom header) is
+# origin-bound: only the origin the caller named receives it.
+CROSS_ORIGIN_SAFE_HEADERS = frozenset({"accept", "accept-language", "user-agent", "cache-control", "pragma",
+                                       "dnt", "upgrade-insecure-requests"})
+
+
+def cross_origin_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    """The caller headers that may be sent to an origin other than the one named."""
+    return {k: v for k, v in (headers or {}).items() if k.lower() in CROSS_ORIGIN_SAFE_HEADERS}
 
 
 class InvalidUrl(ValueError):
@@ -94,14 +104,38 @@ def _requote(component: str) -> str:
     return quote(component, safe=_SAFE)
 
 
+# IPv6 forms that carry an IPv4 address in their low 32 bits; a translator (NAT64, SIIT)
+# or a dual-stack host may deliver them to that IPv4, so they are judged by it.
+_LOW32_IPV4_NETS = (
+    ipaddress.IPv6Network("64:ff9b::/96"),  # NAT64 well-known prefix (RFC 6052)
+    ipaddress.IPv6Network("::/96"),  # IPv4-compatible ::a.b.c.d (deprecated, RFC 4291)
+    ipaddress.IPv6Network("::ffff:0:0:0/96"),  # IPv4-translated ::ffff:0:a.b.c.d (RFC 2765)
+)
+# NAT64 local-use prefix (RFC 8215): never globally reachable, and operators may place the
+# IPv4 at several bit positions inside it, so it is refused whatever it embeds.
+_LOCAL_NAT64 = ipaddress.IPv6Network("64:ff9b:1::/48")
+
+
+def _embedded_ipv4(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    if addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    if addr.sixtofour is not None:
+        return addr.sixtofour
+    if addr.teredo is not None:
+        return addr.teredo[1]
+    if any(addr in net for net in _LOW32_IPV4_NETS):
+        return ipaddress.IPv4Address(int(addr) & 0xFFFF_FFFF)
+    return None
+
+
 def ip_is_public(ip: str) -> bool:
     addr = ipaddress.ip_address(ip)
     if isinstance(addr, ipaddress.IPv6Address):
-        mapped = addr.ipv4_mapped or addr.sixtofour
-        if mapped is not None:
-            addr = mapped
-        elif addr.teredo is not None:
-            addr = addr.teredo[1]
+        if addr in _LOCAL_NAT64:
+            return False
+        embedded = _embedded_ipv4(addr)
+        if embedded is not None:
+            addr = embedded
     return bool(addr.is_global) and not addr.is_multicast
 
 
