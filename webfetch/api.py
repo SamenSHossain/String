@@ -26,6 +26,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from .config import Settings, load_settings
+from .decode import whatwg_name
 from .fetcher import HttpFetcher
 from .netguard import BlockedDestination, InvalidUrl, normalize_url, resolve_public
 from .service import JSON_INCLUDES, BrowserClient, Expect, FetchOptions, run_fetch
@@ -35,11 +36,6 @@ log = logging.getLogger("webfetch")
 # Outcomes that mean "we could not get past what the destination served".
 FAILED_OUTCOMES = {"challenge", "blocked", "consent_wall", "age_gate", "login_wall", "js_required",
                    "empty", "validation_failed", "rate_limited"}
-# Python codec name -> the label browsers and HTTP clients expect in Content-Type.
-_CHARSET_LABELS = {"cp932": "Shift_JIS", "gb18030": "GB18030", "big5hkscs": "Big5", "cp949": "EUC-KR",
-                   "cp1252": "windows-1252", "cp1251": "windows-1251", "cp1250": "windows-1250",
-                   "cp1253": "windows-1253", "cp1254": "windows-1254", "cp874": "windows-874",
-                   "koi8-r": "KOI8-R", "euc_jp": "EUC-JP", "utf-8": "utf-8"}
 FORBIDDEN_HEADERS = {"host", "connection", "content-length", "transfer-encoding", "te", "upgrade",
                      "keep-alive", "trailer", "proxy-authorization", "proxy-authenticate", "proxy-connection"}
 MAX_SCHEMA_BYTES = 50_000
@@ -406,8 +402,9 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
             hdrs["x-encoding"] = env.get("encoding", "")
             ctype = env.get("contentType") or "application/octet-stream"
             if "charset=" not in ctype.lower() and (ctype.startswith("text/") or "html" in ctype or "xml" in ctype):
-                # Original bytes in their original encoding: label it, or clients assume UTF-8.
-                ctype = f"{ctype}; charset={_CHARSET_LABELS.get(env.get('encoding', ''), env.get('encoding') or 'utf-8')}"
+                # Original bytes in their original encoding: label it (by the name browsers and HTTP
+                # clients know, e.g. Shift_JIS, EUC-JP, windows-1255), or clients assume UTF-8.
+                ctype = f"{ctype}; charset={whatwg_name(env.get('encoding') or 'utf-8')}"
             hdrs["content-type"] = ctype
             hdrs["content-disposition"] = "attachment"
             return Response(raw or b"", headers=hdrs)

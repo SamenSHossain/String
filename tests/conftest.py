@@ -50,6 +50,11 @@ NU_HOME = """<!DOCTYPE html><html lang="nl"><head><title>NU - Het laatste nieuws
 ZEIT_PAGE = """<!DOCTYPE html><html lang="de"><head><title>ZEIT ONLINE | Nachrichten</title></head>
 <body><main><h1>Nachrichten, Hintergründe und Debatten</h1><p>""" + ("Ein Artikel über Politik. " * 60) + """</p></main></body></html>"""
 
+# Sample text per Python codec for the /legacy/<label>/<codec> route.
+LEGACY_SAMPLES = {"euc_jp": "日本語のページです。", "iso8859_2": "Zażółć gęślą jaźń. ", "cp1255": "שלום עולם. ",
+                  "koi8_u": "Привіт, світ. ", "cp866": "Привет, мир. ", "big5hkscs": "中文網頁內容。",
+                  "cp949": "한국어 페이지입니다. ", "mac_roman": "Café crème. "}
+
 CHALLENGE_PAGE = """<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>
 <div id="cf-wrapper">Checking your browser</div><script>window._cf_chl_opt={cvId:'3'}</script></body></html>"""
 
@@ -165,6 +170,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/sjis":
                 body = ('<html><head><meta charset="Shift_JIS"><title>テスト</title></head><body><p>'
                         + "日本語のページです。" * 30 + "</p></body></html>").encode("cp932")
+                return self._send(200, body, headers={"Content-Type": "text/html"})
+            if path.startswith("/legacy/"):  # /legacy/<label>/<python codec>: a <meta>-declared legacy page
+                label, codec = path.split("/")[2:4]
+                body = (f'<html><head><meta charset="{label}"></head><body><p>'
+                        + LEGACY_SAMPLES[codec] * 20 + "</p></body></html>").encode(codec)
                 return self._send(200, body, headers={"Content-Type": "text/html"})
             if path == "/challenge":
                 return self._send(403, CHALLENGE_PAGE)

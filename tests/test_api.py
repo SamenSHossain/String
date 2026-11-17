@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests import fakedns
+from tests.conftest import LEGACY_SAMPLES
 from webfetch import fetcher as fetcher_mod
 from webfetch.api import create_app
 from webfetch.config import Settings
@@ -131,6 +132,18 @@ def test_raw_keeps_original_bytes_and_labels_their_charset(server, client):
     assert r.status_code == 200
     assert r.headers["content-type"] == "text/html; charset=Shift_JIS"
     assert "日本語".encode("cp932") in r.content
+
+
+@pytest.mark.parametrize("label,codec,name", [
+    ("euc-jp", "euc_jp", "EUC-JP"), ("iso-8859-2", "iso8859_2", "ISO-8859-2"), ("windows-1255", "cp1255", "windows-1255"),
+    ("koi8-u", "koi8_u", "KOI8-U"), ("ibm866", "cp866", "IBM866"), ("big5", "big5hkscs", "Big5"),
+    ("euc-kr", "cp949", "EUC-KR"), ("macintosh", "mac_roman", "macintosh")])
+def test_raw_labels_any_legacy_charset_by_its_browser_name(server, client, label, codec, name):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/legacy/{label}/{codec}", "format": "raw"})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == f"text/html; charset={name}"
+    assert r.content.decode(codec).count(LEGACY_SAMPLES[codec]) == 20
 
 
 def test_binary_as_markdown_is_415(server, client):
