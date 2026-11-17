@@ -42,7 +42,13 @@ for concept, words in {
     "reviewsummary": "reviewsummary userreviews reviewscore",
     "brand": "brand manufacturer make",
     "availability": "availability instock stock stockstatus available",
-    "sku": "sku productid mpn gtin ean upc isbn",
+    # Identifiers are separate concepts: a shop's SKU is not an ISBN, a UPC or an EAN.
+    "sku": "sku productid",
+    "mpn": "mpn",
+    "gtin": "gtin barcode",
+    "ean": "ean ean13",
+    "upc": "upc",
+    "isbn": "isbn",
     "language": "language lang locale inlanguage",
     "sitename": "site sitename source outlet publication website",
     "keywords": "keywords tags topics labels usertags",
@@ -79,7 +85,12 @@ _CONCEPT_KEYS: dict[str, list[str]] = {
     "reviewsummary": ["reviewsummary"],
     "brand": ["brand", "manufacturer"],
     "availability": ["availability"],
-    "sku": ["sku", "gtin13", "gtin12", "gtin14", "gtin8", "gtin", "mpn", "productid", "isbn"],
+    "sku": ["sku", "productid"],
+    "mpn": ["mpn"],
+    "gtin": ["gtin13", "gtin12", "gtin14", "gtin8", "gtin"],
+    "ean": ["ean", "gtin13"],  # EAN-13 is GTIN-13
+    "upc": ["upc", "gtin12"],  # UPC-A is GTIN-12
+    "isbn": ["isbn"],
     "language": ["inlanguage", "lang", "language", "oglocale"],
     "sitename": ["ogsitename", "sitename", "publisher"],
     "keywords": ["keywords", "tags", "articletag", "newskeywords"],
@@ -87,6 +98,9 @@ _CONCEPT_KEYS: dict[str, list[str]] = {
     "developer": ["developer", "developers"],
     "publisher": ["publisher", "publishers"],
 }
+# An identifier is only ever read from the entity itself, never from one nested in it.
+_IDENTIFIERS = {"sku", "mpn", "gtin", "ean", "upc", "isbn"}
+_IDENTIFIER_KEYS = {k for c in _IDENTIFIERS for k in _CONCEPT_KEYS[c]}
 
 _SOURCE_RANK = {"site": 0, "json-ld": 1, "microdata": 2, "meta": 3, "dom": 4}
 _MAIN_TYPES = {
@@ -98,16 +112,26 @@ _MAIN_TYPES = {
 }
 _BOILERPLATE_TYPES = {"website", "organization", "breadcrumblist", "webpage", "sitenavigationelement",
                       "imageobject", "searchaction", "wpheader", "wpfooter", "listitem", "collectionpage"}
+# Broader names a caller may give the page's main entity (an "article" field on a BlogPosting).
+_TYPE_ALIASES = {
+    "blogposting": ("article", "post"), "liveblogposting": ("article", "post"), "jobposting": ("job",),
+    "videoobject": ("video",), "softwareapplication": ("app", "software"), "mobileapplication": ("app",),
+    "vehicle": ("product",), "car": ("product", "vehicle"), "musicrecording": ("song", "track"),
+    "tvseries": ("show",), "restaurant": ("business",), "hotel": ("business",),
+}
+_MAX_CANDS = 50_000  # candidates per page: a dense @id graph or a huge JSON-LD blob stops here
+_MAX_NESTING = 12  # object/array levels filled; a self-referencing model stops here at the latest
 
 
-@dataclass
+@dataclass(slots=True)
 class Cand:
     key: str  # normalized last path segment
     path: str
     value: Any
     source: str  # site | json-ld | microdata | meta | dom
-    entity: int  # 0 main entity, 1 other, 2 boilerplate
+    entity: int  # 0 main entity, 1 page-level, 2 other entity, 3 boilerplate
     depth: int
+    base: int = 0  # leading path segments that name the scope it was read in (not foreign)
 
     @property
     def label(self) -> str:
@@ -141,29 +165,74 @@ _FOREIGN = {"author", "creator", "publisher", "brand", "manufacturer", "review",
             "mainentityofpage", "breadcrumb", "itemlistelement", "provider", "seller", "sourceorganization",
             "copyrightholder", "contributor", "editor", "logo", "potentialaction", "about", "mentions",
             "hasmap", "subjectof", "workexample", "parentorganization", "founder", "employee", "member",
-            "image", "thumbnail", "thumbnailurl", "video", "audio", "associatedmedia", "primaryimageofpage"}
+            "image", "thumbnail", "thumbnailurl", "video", "audio", "associatedmedia", "primaryimageofpage",
+            "isrelatedto", "issimilarto", "isaccessoryorsparepartfor", "isconsumablefor", "hasvariant",
+            "isvariantof"}
+
+
+def _ref_id(v: Any) -> str | None:
+    """The @id of a pure reference ({"@id": ...}, optionally with "@type"), else None."""
+    if isinstance(v, dict) and isinstance(v.get("@id"), str) and set(v) <= {"@id", "@type"}:
+        return v["@id"]
+    return None
+
+
+def _deref(v: Any, index: dict[str, dict], seen: frozenset) -> tuple[Any, frozenset]:
+    """Replace a reference to another @graph node, or a list of them (Yoast's
+    "author": [{"@id": ...}]), with the node itself. ``seen`` holds the @ids already expanded
+    on the way here, so a reference cycle stops instead of looping."""
+    if isinstance(v, dict):
+        ref = _ref_id(v)
+        return (index[ref], seen | {ref}) if ref in index and ref not in seen else (v, seen)
+    if isinstance(v, list):
+        ids = {r for i in v if isinstance(i, dict) and (r := _ref_id(i)) in index and r not in seen}
+        if ids:
+            return [index[r] if isinstance(i, dict) and (r := _ref_id(i)) in ids else i for i in v], seen | ids
+    return v, seen
 
 
 def _walk(node: Any, path: str, source: str, entity: int, depth: int, out: list[Cand],
-          index: dict[str, dict] | None = None, seen: frozenset = frozenset()) -> None:
-    if depth > 8:
+          index: dict[str, dict] | None = None, seen: frozenset = frozenset(), base: int = 0) -> None:
+    if depth > 8 or len(out) >= _MAX_CANDS:
         return
     if isinstance(node, dict):
         for k, v in node.items():
-            if k in ("@context",) or (k.startswith("@") and k not in ("@id", "@value")):
+            if k.startswith("@") and k not in ("@id", "@value"):
+                continue
+            if len(out) >= _MAX_CANDS:
+                return
+            p = f"{path}.{k}" if path else k
+            if not isinstance(v, (dict, list)):
+                out.append(Cand(norm(k), p, v, source, entity, depth, base))
                 continue
             # {"@id": "...#primaryimage"} points at another node of the @graph: use that node.
-            if isinstance(v, dict) and index and set(v) <= {"@id", "@type"} and v.get("@id") in index \
-                    and v["@id"] not in seen:
-                v = index[v["@id"]]
-                seen = seen | {v.get("@id")}
-            p = f"{path}.{k}" if path else k
-            out.append(Cand(norm(k), p, v, source, entity, depth))
-            if isinstance(v, (dict, list)):
-                _walk(v, p, source, entity, depth + 1, out, index, seen)
+            # A node is expanded once per object (not again for a later key), which keeps
+            # Yoast-style graphs, where everything points at everything, small.
+            if index and (isinstance(v, list) or "@id" in v):
+                v, seen = _deref(v, index, seen)
+            out.append(Cand(norm(k), p, v, source, entity, depth, base))
+            _walk(v, p, source, entity, depth + 1, out, index, seen, base)
     elif isinstance(node, list):
         for item in node[:200]:
-            _walk(item, path, source, entity, depth, out, index, seen)
+            # A list directly inside a list counts as a level, so [[[...]]] cannot recurse unbounded.
+            _walk(item, path, source, entity, depth + 1 if isinstance(item, list) else depth, out, index,
+                  seen, base)
+
+
+def _declared_main(nodes: list) -> set[int]:
+    """The JSON-LD nodes (by object id) the page declares as its main entity: a main-type
+    node with mainEntityOfPage, or a node whose @id another node's mainEntity names."""
+    named: set[str] = set()
+    for n in nodes:
+        if isinstance(n, dict):
+            v = n.get("mainEntity")
+            for item in (v if isinstance(v, list) else [v])[:50]:
+                ref = item.get("@id") if isinstance(item, dict) else item
+                if isinstance(ref, str):
+                    named.add(ref)
+    return {id(n) for n in nodes if isinstance(n, dict) and (
+        (n.get("mainEntityOfPage") and _entity_rank(_types_of(n)) == 0)
+        or (isinstance(n.get("@id"), str) and n["@id"] in named))}
 
 
 def build_candidates(
@@ -177,13 +246,23 @@ def build_candidates(
     for key, (value, path) in (site or {}).items():
         out.append(Cand(norm(key), path, value, "site", 0, 0))
     index = {n["@id"]: n for n in jsonld if isinstance(n, dict) and isinstance(n.get("@id"), str)}
+    declared = _declared_main(jsonld)
     for source, nodes in (("json-ld", jsonld), ("microdata", microdata)):
         for node in nodes:
             if not isinstance(node, dict):
                 continue
             types = _types_of(node)
+            rank = _entity_rank(types)
+            # A page that names its main entity (BBC Good Food: the Recipe, after an embedded
+            # VideoObject) ranks its other Recipe/Article/Video... nodes as other entities.
+            if rank == 0 and declared and source == "json-ld" and id(node) not in declared:
+                rank = 2
             label = types[0] if types else "Thing"
-            _walk(node, label, source, _entity_rank(types), 0, out, index if source == "json-ld" else None)
+            if types:  # never matches a field (no normalized name starts with "@")
+                out.append(Cand("@type", f"{label}.@type", [norm(t) for t in types], source, rank, 0))
+            own = node.get("@id") if source == "json-ld" else None
+            _walk(node, label, source, rank, 0, out, index if source == "json-ld" else None,
+                  frozenset([own]) if isinstance(own, str) else frozenset())
     for key, value in (metadata.get("openGraph") or {}).items():
         out.append(Cand(norm(key.split(":", 1)[-1]) if key.startswith("og:") else norm(key), key, value, "meta", 1, 0))
         out.append(Cand(norm(key), key, value, "meta", 1, 0))
@@ -244,7 +323,7 @@ def parse_number(value: Any) -> float | None:
         return None
 
 
-def _to_text(value: Any, join: bool) -> str | None:
+def _to_text(value: Any, join: bool, depth: int = 0) -> str | None:
     if value is None:
         return None
     if isinstance(value, str):
@@ -258,8 +337,8 @@ def _to_text(value: Any, join: bool) -> str | None:
             if isinstance(value.get(k), (str, int, float)):
                 return str(value[k]).strip() or None
         return None
-    if isinstance(value, list):
-        parts = [t for t in (_to_text(v, False) for v in value) if t]
+    if isinstance(value, list) and depth < 4:  # a page's [[[...]]] must not exhaust the stack
+        parts = [t for t in (_to_text(v, False, depth + 1) for v in value) if t]
         if not parts:
             return None
         return ", ".join(dict.fromkeys(parts)) if join else parts[0]
@@ -309,6 +388,31 @@ _URLISH = re.compile(r"^(https?://|//|/|\./|\.\./|data:)|^[^\s/]+\.[a-z]{2,}(/|$
 
 # --------------------------------------------------------------------------- filling
 
+def _number_variants(p: str) -> tuple[str, ...]:
+    """Singular/plural spellings of a normalized name: offer <-> offers, category <-> categories."""
+    if p.endswith("ies"):
+        return (p[:-3] + "y",)
+    if p.endswith("s"):
+        return (p[:-1], p[:-2]) if p.endswith("es") else (p[:-1],)
+    return (p + "s", p[:-1] + "ies") if p.endswith("y") else (p + "s", p + "es")
+
+
+def _scope(c: Cand) -> list[Cand] | None:
+    """The candidates inside the page object ``c`` holds (the first of a list). A plain string
+    ("author": "Staff Reporter", or Steam's list of genres) becomes that object's name."""
+    v = c.value
+    if isinstance(v, list):
+        v = v[0] if v and isinstance(v[0], (dict, str)) else None
+    base = c.path.count(".") + 1  # c.path names the scope: inside it, nothing is foreign
+    if isinstance(v, dict):
+        sub: list[Cand] = []
+        _walk(v, c.path, c.source, c.entity, c.depth + 1, sub, base=base)
+        return sub
+    if isinstance(v, (str, int, float)) and str(v).strip():
+        return [Cand("name", c.path, v, c.source, c.entity, c.depth, base)]
+    return None
+
+
 class SchemaFiller:
     def __init__(self, cands: list[Cand], base_url: str, root: dict | None = None):
         self.cands = cands
@@ -316,26 +420,72 @@ class SchemaFiller:
         self.root = root or {}
         self.sources: dict[str, str] = {}
         self.missing: list[str] = []
+        self._main_types: set[str] | None = None
 
-    def _norm(self, schema: Any, depth: int = 0) -> dict:
-        """Resolve $ref and collapse nullable anyOf/oneOf (the shape Pydantic emits)."""
-        if not isinstance(schema, dict) or depth > 20:
-            return schema if isinstance(schema, dict) else {}
-        ref = schema.get("$ref")
-        if isinstance(ref, str) and ref.startswith("#/"):
-            target: Any = self.root
-            for part in ref[2:].split("/"):
-                target = target.get(part, {}) if isinstance(target, dict) else {}
-            merged = {**target, **{k: v for k, v in schema.items() if k != "$ref"}}
-            return self._norm(merged, depth + 1)
-        for key in ("anyOf", "oneOf"):
-            options = schema.get(key)
-            if isinstance(options, list):
-                real = [o for o in options if not (isinstance(o, dict) and o.get("type") == "null")]
-                if len(real) == 1:
-                    merged = {**self._norm(real[0], depth + 1), **{k: v for k, v in schema.items() if k != key}}
-                    return merged
-        return schema
+    def _resolve(self, schema: Any) -> tuple[dict, frozenset, bool]:
+        """Resolve $ref and collapse a one-option anyOf/oneOf/allOf (the shapes Pydantic emits).
+
+        Returns the schema, the $refs followed (a model that contains itself shows up as a
+        $ref already being filled) and whether the field allows null (Optional[...])."""
+        refs: set[str] = set()
+        nullable = False
+        for _ in range(20):  # a longer $ref chain is left unresolved
+            if not isinstance(schema, dict):
+                return {}, frozenset(refs), nullable
+            t = schema.get("type")
+            if (isinstance(t, list) and "null" in t) or ("default" in schema and schema["default"] is None):
+                nullable = True
+            ref = schema.get("$ref")
+            if isinstance(ref, str) and (ref == "#" or ref.startswith("#/")):
+                refs.add(ref)
+                schema = {**self._pointer(ref), **{k: v for k, v in schema.items() if k != "$ref"}}
+                continue
+            for key in ("anyOf", "oneOf", "allOf"):
+                options = schema.get(key)
+                if not isinstance(options, list):
+                    continue
+                real = options if key == "allOf" else [
+                    o for o in options if not (isinstance(o, dict) and o.get("type") == "null")]
+                nullable = nullable or len(real) < len(options)
+                if len(real) == 1 and isinstance(real[0], dict):
+                    schema = {**real[0], **{k: v for k, v in schema.items() if k != key}}
+                    break
+            else:
+                break  # nothing left to resolve
+        return schema if isinstance(schema, dict) else {}, frozenset(refs), nullable
+
+    def _pointer(self, ref: str) -> dict:
+        """The schema a local $ref ("#", "#/$defs/Model") points at; {} when there is none."""
+        target: Any = self.root
+        for part in ref[2:].split("/") if ref != "#" else ():
+            part = part.replace("~1", "/").replace("~0", "~")
+            if isinstance(target, list) and part.isdigit() and int(part) < len(target):
+                target = target[int(part)]
+            else:
+                target = target.get(part) if isinstance(target, dict) else None
+        return target if isinstance(target, dict) else {}
+
+    @property
+    def main_types(self) -> set[str]:
+        """Normalized @types of the page's main entity, plus og:type when it names one."""
+        if self._main_types is None:
+            types: set[str] = set()
+            for c in self.cands:
+                if c.key == "@type" and c.entity == 0:
+                    types.update(c.value)
+                elif c.path == "og:type" and isinstance(c.value, str):
+                    t = norm(c.value.rsplit(".", 1)[-1])  # "product", "video.movie"
+                    if t in _MAIN_TYPES:
+                        types.add(t)
+            self._main_types = types
+        return self._main_types
+
+    def _names_main_entity(self, name: str) -> bool:
+        """Does ``name`` name the page's main entity ("product" on a Product page, "article" on
+        a NewsArticle or BlogPosting, "game" on a VideoGame)?"""
+        w = norm(name)
+        return any(w == t or w in _TYPE_ALIASES.get(t, ()) or (len(w) >= 4 and t.endswith(w))
+                   for t in self.main_types)
 
     def _ranked(self, prop: str, description: str = "", pool: list[Cand] | None = None) -> list[Cand]:
         pool = self.cands if pool is None else pool
@@ -348,6 +498,7 @@ class SchemaFiller:
                     break
         keys = _CONCEPT_KEYS.get(concept or "", [])
         wanted = {p, concept or ""}
+        ident = concept in _IDENTIFIERS or p in _IDENTIFIER_KEYS
         scored = []
         for c in pool:
             if c.key == p:
@@ -357,8 +508,10 @@ class SchemaFiller:
             else:
                 continue
             # Inside another entity (Article.author.name for "name")? Rank it below the page's own.
-            segments = {norm(seg) for seg in c.path.split(".")[1:-1]}
+            segments = {norm(seg) for seg in c.path.split(".")[max(1, c.base):-1]}
             foreign = bool(segments & _FOREIGN) and not (segments & wanted)
+            if foreign and ident:
+                continue  # another entity's ID (a subscription's isPartOf.productID) is never this one's
             # Curated site fields first; then the page's main entity before other entities, so
             # Article.headline beats a Person node's exact "name"; then match quality and source.
             rank = (-1 if c.source == "site" else 0, 1 if foreign else 0, c.entity, kind, _SOURCE_RANK[c.source], c.depth)
@@ -367,18 +520,23 @@ class SchemaFiller:
         return [c for _, c in scored]
 
     def fill(self, schema: dict, prop: str = "", path: str = "", pool: list[Cand] | None = None,
-             description: str = "") -> Any:
-        schema = self._norm(schema)
+             description: str = "", active: frozenset = frozenset(), level: int = 0) -> Any:
+        """``active``: the $refs being filled on this path; ``level``: object/array nesting."""
+        schema, refs, _ = self._resolve(schema)
+        return self._fill_resolved(schema, prop, path, pool, description, active | refs if refs else active, level)
+
+    def _fill_resolved(self, schema: dict, prop: str, path: str, pool: list[Cand] | None, description: str,
+                       active: frozenset, level: int) -> Any:
         stype = schema.get("type")
         if isinstance(stype, list):
             stype = next((t for t in stype if t != "null"), None)
         if stype == "object" or (stype is None and isinstance(schema.get("properties"), dict)):
-            return self._fill_object(schema, path, pool)
+            return self._fill_object(schema, path, pool, active, level)
         if not prop:
             return None
         ranked = self._ranked(prop, description or str(schema.get("description") or ""), pool)
         if stype == "array":
-            return self._fill_array(schema, prop, path, ranked)
+            return self._fill_array(schema, prop, path, ranked, active, level)
         for c in ranked:
             value = self._coerce(schema, stype, c.value, prop)
             if value is not None:
@@ -387,64 +545,88 @@ class SchemaFiller:
         self.missing.append(path)
         return None
 
-    def _fill_object(self, schema: dict, path: str, pool: list[Cand] | None) -> dict:
-        schema = self._norm(schema)
-        out = {}
-        for name, sub in (schema.get("properties") or {}).items():
-            sub = self._norm(sub)
-            if not isinstance(sub, dict):
-                continue
+    def _fill_object(self, schema: dict, path: str, pool: list[Cand] | None,
+                     active: frozenset = frozenset(), level: int = 0) -> dict:
+        schema, refs, _ = self._resolve(schema)
+        active = active | refs if refs else active
+        props = schema.get("properties")
+        out: dict[str, Any] = {}
+        for name, raw in (props.items() if isinstance(props, dict) else ()):
+            sub, sub_refs, nullable = self._resolve(raw)
             sub_path = f"{path}.{name}" if path else name
-            sub_type = sub.get("type")
-            if sub_type == "object" or isinstance(sub.get("properties"), dict):
-                scoped = self._scoped_pool(name, pool)
-                out[name] = self._fill_object(sub, sub_path, pool if scoped is None else scoped)
+            if sub.get("type") == "object" or isinstance(sub.get("properties"), dict):
+                out[name] = self._fill_member(name, sub, sub_path, pool, active, sub_refs, nullable, level)
             else:
-                out[name] = self.fill(sub, name, sub_path, pool, str(sub.get("description") or ""))
+                out[name] = self._fill_resolved(sub, name, sub_path, pool, str(sub.get("description") or ""),
+                                                active | sub_refs if sub_refs else active, level + 1)
         return out
 
-    def _scoped_pool(self, name: str, pool: list[Cand] | None) -> list[Cand] | None:
-        """Candidates read from inside the object whose key matches ``name``.
+    def _fill_member(self, name: str, schema: dict, path: str, pool: list[Cand] | None, active: frozenset,
+                     refs: frozenset, nullable: bool, level: int) -> dict | None:
+        """An object-typed property, filled from the page object its name matches. With no such
+        object, a plain grouping ({"price", "currency"}) is filled from the enclosing scope, but
+        a model inside itself (Category.parent) or an Optional[Model] the page does not carry
+        (warranty) is null: the page's title under another name would be a guess. An optional
+        wrapper named after the page's main entity (product on a Product page) is filled."""
+        scoped = self._scoped_pool(name, pool) if level < _MAX_NESTING else None
+        if scoped is None and (level >= _MAX_NESTING or refs & active
+                               or (nullable and not self._names_main_entity(name))):
+            self.missing.append(path)
+            return None
+        return self._fill_object(schema, path, pool if scoped is None else scoped, active | refs, level + 1)
 
-        None when the page has no such key (the schema just groups fields: fill from the
-        whole page). When the key holds a plain string ("author": "Staff Reporter"), the
-        object is filled from that string alone (as its name), never from other entities."""
+    def _scoped_pool(self, name: str, pool: list[Cand] | None) -> list[Cand] | None:
+        """Candidates read from inside the object whose key matches ``name`` (or its singular or
+        plural: "offer" finds "offers"). None when the page has no such key. When the key holds
+        a plain string ("author": "Staff Reporter") or a list of strings (genres), the object is
+        filled from that string alone (as its name), never from other entities."""
         for c in self._ranked(name, "", pool):
-            if isinstance(c.value, dict):
-                sub: list[Cand] = []
-                _walk(c.value, c.path, c.source, c.entity, c.depth + 1, sub)
+            sub = _scope(c)
+            if sub is not None:
                 return sub
-            if isinstance(c.value, list) and c.value and isinstance(c.value[0], dict):
-                sub = []
-                _walk(c.value[0], c.path, c.source, c.entity, c.depth + 1, sub)
-                return sub
-            if isinstance(c.value, (str, int, float)) and str(c.value).strip():
-                return [Cand("name", c.path, c.value, c.source, c.entity, c.depth)]
+        alts = _number_variants(norm(name))
+        hits = [c for c in (self.cands if pool is None else pool) if c.key in alts]
+        for alt in alts if hits else ():
+            for c in self._ranked(alt, "", hits):
+                sub = _scope(c) if c.key == alt else None
+                if sub is not None:
+                    return sub
         return None
 
-    def _fill_array(self, schema: dict, prop: str, path: str, ranked: list[Cand]) -> list | None:
-        items_schema = self._norm(schema.get("items")) if isinstance(schema.get("items"), dict) else {}
+    def _fill_array(self, schema: dict, prop: str, path: str, ranked: list[Cand],
+                    active: frozenset = frozenset(), level: int = 0) -> list | None:
+        items = schema.get("items")
+        items_schema, item_refs, _ = self._resolve(items) if isinstance(items, dict) else ({}, frozenset(), False)
         item_type = items_schema.get("type")
+        objects = item_type == "object" or isinstance(items_schema.get("properties"), dict)
         concept = _concept(norm(prop))
         url_items = (items_schema.get("format") in ("uri", "url", "iri")) or concept in {"image", "url"}
+        limit = schema.get("maxItems")
+        limit = limit if isinstance(limit, int) and not isinstance(limit, bool) and limit >= 0 else None
         for c in ranked:
             values = _as_list(c.value, split=not url_items)
+            if objects:
+                dicts = [v for v in values if isinstance(v, dict)][:limit]
+                if not dicts or level >= _MAX_NESTING:
+                    continue
+                self.sources[path] = c.label
+                base = c.path.count(".") + 1
+                out = []
+                for i, v in enumerate(dicts):
+                    sub: list[Cand] = []
+                    _walk(v, c.path, c.source, c.entity, c.depth + 1, sub, base=base)
+                    # Each item's fields keep their own source, and its nulls are listed in
+                    # missing ("recipeInstructions[0].name", "authors[0].url").
+                    out.append(self._fill_object(items_schema, f"{path}[{i}]", sub, active | item_refs, level + 1))
+                return out
             out = []
             for v in values:
-                if item_type == "object" or isinstance(items_schema.get("properties"), dict):
-                    if isinstance(v, dict):
-                        sub: list[Cand] = []
-                        _walk(v, c.path, c.source, c.entity, c.depth + 1, sub)
-                        sub_filler = SchemaFiller(sub, self.base_url, self.root)
-                        out.append(sub_filler._fill_object(items_schema, "", sub))
-                    continue
                 coerced = self._coerce(items_schema, item_type, v, prop)
                 if coerced is not None and coerced not in out:
                     out.append(coerced)
             if out:
-                max_items = schema.get("maxItems")
                 self.sources[path] = c.label
-                return out[: int(max_items)] if isinstance(max_items, int) else out
+                return out[:limit]
         self.missing.append(path)
         return None
 
@@ -491,9 +673,12 @@ class SchemaFiller:
 
 def fill_schema(schema: dict, cands: list[Cand], base_url: str) -> dict[str, Any]:
     filler = SchemaFiller(cands, base_url, root=schema)
-    data = filler.fill(schema)
+    data = filler.fill(schema, active=frozenset({"#"}))
     total = len(filler.sources) + len(filler.missing)
-    required = [r for r in (schema.get("required") or []) if isinstance(r, str)]
+    # Read "required" from the resolved root: Pydantic emits a self-referencing model as
+    # {"$ref": "#/$defs/Model", "$defs": {...}}, with the list inside the definition.
+    required = filler._resolve(schema)[0].get("required")
+    required = [r for r in required if isinstance(r, str)] if isinstance(required, list) else []
     missing_required = [r for r in required if isinstance(data, dict) and data.get(r) in (None, [], "")]
     return {
         "data": data,
