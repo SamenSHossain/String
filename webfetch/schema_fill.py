@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -135,7 +136,17 @@ _MAX_NESTING = 12  # object/array levels filled; a self-referencing model stops 
 # multiplies array items, and one long page value can be asked for under 200 names.
 _MAX_FIELDS = 10_000  # schema members filled: properties and array items
 _MAX_WORK = 100_000  # candidates ranked, page values walked, list items and (per 32 chars) text coerced
-_MAX_CHARS = 1_000_000  # characters returned: values, keys, and the paths in sources and missing
+_MAX_BYTES = 1_000_000  # bytes of JSON returned: values, keys, and the paths in sources and missing
+# The response's own JSON encoding (UTF-8; NaN and infinities cannot be written).
+_JSON = json.JSONEncoder(ensure_ascii=False, allow_nan=False)
+
+
+def _json_len(value: Any) -> int:
+    """Bytes ``value`` takes in the response. Not its characters: a control character is
+    written as six bytes and most scripts as two or three per character, so a budget in
+    characters would let a page's text come back several times larger than the budget."""
+    text = _JSON.encode(value)
+    return len(text) if text.isascii() else len(text.encode("utf-8", "surrogatepass"))
 
 
 @dataclass(slots=True)
@@ -214,20 +225,47 @@ def _deref(v: Any, index: dict[str, dict], seen: frozenset) -> tuple[Any, frozen
     "author": [{"@id": ...}]), with the node itself. ``seen`` holds the @ids already expanded
     on the way here, so a reference cycle stops instead of looping.
 
-    A list is read as far as the walk reads it, and a node it names twice is one node: 1,000
-    references to a node that holds 1,000 more would be a million items to walk and to fill."""
+    A list is read as far as the walk reads it (a longer one is a _RefList), and a node it
+    names twice is one node: 1,000 references to a node that holds 1,000 more would be a
+    million items to walk and to fill."""
     if isinstance(v, dict):
         ref = _ref_id(v)
         return (index[ref], seen | {ref}) if ref in index and ref not in seen else (v, seen)
-    out, ids = [], set()
-    for item in v[:_LIST_ITEMS]:
+    out, ids = _RefList() if len(v) > _LIST_ITEMS else [], set()
+    _deref_into(out, v[:_LIST_ITEMS], index, seen, ids)
+    if not ids:
+        return v, seen
+    if len(v) > _LIST_ITEMS:
+        out.rest = (v, index, seen, frozenset(ids))
+    return out, seen | ids
+
+
+def _deref_into(out: list, items: list, index: dict[str, dict], seen: frozenset, ids: set) -> None:
+    for item in items:
         ref = _ref_id(item)
         if ref not in index or ref in seen:
             out.append(item)
         elif ref not in ids:
             ids.add(ref)
             out.append(index[ref])
-    return (out, seen | ids) if ids else (v, seen)
+
+
+class _RefList(list):
+    """The first _LIST_ITEMS entries of a longer reference list, dereferenced: all the walk
+    reads of any list. The rest is read by the one consumer that returns every entry, an
+    array being filled from the list, which pays for it out of its own budget; reading it
+    for every path that reaches the list is what a page could multiply."""
+    __slots__ = ("rest",)
+
+    @property
+    def unread(self) -> int:
+        return len(self.rest[0]) - _LIST_ITEMS
+
+    def whole(self) -> list:
+        v, index, seen, ids = self.rest
+        out = list(self)
+        _deref_into(out, v[_LIST_ITEMS:], index, seen, set(ids))
+        return out
 
 
 class _Walk:
@@ -482,7 +520,7 @@ class SchemaFiller:
         self.sources: dict[str, str] = {}
         self.missing: list[str] = []
         self.defaulted: set[str] = set()  # root properties answered with their schema default
-        self.fields, self.work, self.chars = _MAX_FIELDS, _MAX_WORK, _MAX_CHARS
+        self.fields, self.work, self.room = _MAX_FIELDS, _MAX_WORK, _MAX_BYTES
         self.truncated = False  # a budget ran out: what was not reached is null and not in ``missing``
         self._main_types: set[str] | None = None
         # A member reached through 10,000 paths is the same schema node, name, description and
@@ -490,33 +528,36 @@ class SchemaFiller:
         self._resolved: dict[int, tuple[dict, tuple[dict, frozenset, bool]]] = {}
         self._enums: dict[int, tuple[dict, set, dict]] = {}
         self._norms: dict[str, str] = {}
+        self._key_lens: dict[str, int] = {}
         self._described: dict[str, str | None] = {}
 
-    def _spend(self, work: int = 0, chars: int = 0) -> bool:
+    def _spend(self, work: int = 0, size: int = 0) -> bool:
         """Charge the call's budgets, before the work is done. False once one is spent: the
         caller gives up its value, and so does every member after it."""
         if not self.truncated:
             self.work -= work
-            self.chars -= chars
-            self.truncated = self.work < 0 or self.chars < 0
+            self.room -= size
+            self.truncated = self.work < 0 or self.room < 0
         return not self.truncated
 
-    def _source(self, path: str, c: Cand, chars: int = 0) -> bool:
-        """Record where the value at ``path`` (``chars`` long) was read; False when the result
-        has no room left for it."""
-        if self._spend(chars=chars + len(path) + len(c.path) + 16):
+    def _source(self, path: str, c: Cand, size: int = 0) -> bool:
+        """Record where the value at ``path`` (``size`` bytes of JSON) was read; False when the
+        result has no room left for it."""
+        if self._spend(size=size + _json_len(path) + _json_len(c.label) + 2):
             self.sources[path] = c.label
         return not self.truncated
 
     def _miss(self, path: str) -> None:
-        if self._spend(chars=len(path) + 4):
+        if self._spend(size=_json_len(path) + 1):
             self.missing.append(path)
 
     def _default(self, default: Any) -> Any:
-        """The caller's own copy of a schema default, paid for like any value returned."""
+        """The caller's own copy of a schema default, paid for like any value returned. None for
+        one that cannot be written back as JSON: a request may spell NaN and 1e999 (Pydantic
+        does, for ``float('nan')`` and ``math.inf``), a response may not."""
         try:
-            return copy.deepcopy(default) if self._spend(chars=len(repr(default))) else None
-        except (RecursionError, ValueError):  # nested deeper, or an integer longer, than the API lets through
+            return copy.deepcopy(default) if self._spend(size=_json_len(default)) else None
+        except (RecursionError, ValueError):  # not JSON, or nested deeper than the API lets through
             return None
 
     def _enum(self, schema: dict, enum: list) -> tuple[set, dict]:
@@ -531,6 +572,12 @@ class SchemaFiller:
         if name not in self._norms:
             self._norms[name] = norm(name)
         return self._norms[name]
+
+    def _key_len(self, name: str) -> int:
+        """Bytes a property takes in its object before it has a value: "name":null,"""
+        if name not in self._key_lens:
+            self._key_lens[name] = _json_len(name) + 6
+        return self._key_lens[name]
 
     def _resolve(self, schema: Any) -> tuple[dict, frozenset, bool]:
         """Resolve $ref and collapse a one-option anyOf/oneOf/allOf (the shapes Pydantic emits).
@@ -667,7 +714,7 @@ class SchemaFiller:
         for c in ranked:
             value = self._coerce(schema, stype, c.value, prop)
             if value is not None:
-                return value if self._source(path, c, len(str(value))) else None
+                return value if self._source(path, c, _json_len(value)) else None
             if self.truncated:
                 return None
         self._miss(path)
@@ -681,7 +728,7 @@ class SchemaFiller:
         props = props if isinstance(props, dict) else {}
         # The object's keys are paid for before it is opened: whatever runs out inside, its
         # shape is complete, with null for the members that were not reached.
-        if not self._spend(chars=sum(len(name) + 8 for name in props)):
+        if not self._spend(size=sum(self._key_len(name) for name in props)):
             return None
         out: dict[str, Any] = dict.fromkeys(props)
         for name, raw in props.items():
@@ -771,6 +818,10 @@ class SchemaFiller:
         limit = limit if isinstance(limit, int) and not isinstance(limit, bool) and limit >= 0 else None
         for c in ranked:
             values = _as_list(c.value, split=not url_items)
+            if isinstance(values, _RefList):  # an array returns every entry: read the rest of the list
+                if not self._spend(work=values.unread):
+                    return None
+                values = values.whole()
             if not self._spend(work=len(values)):
                 return None
             if objects:
@@ -803,7 +854,7 @@ class SchemaFiller:
                     return None
             if out:
                 out = out[:limit]
-                return out if self._source(path, c, sum(len(str(v)) + 4 for v in out)) else None
+                return out if self._source(path, c, _json_len(out)) else None
         self._miss(path)
         return None
 

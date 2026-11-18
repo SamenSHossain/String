@@ -47,6 +47,8 @@ MAX_BATCH = 20
 BROWSER_COST = 5  # a headless-browser render uses ~5x the resources of an HTTP fetch
 # A String client that posts to the service URL itself, or to it without the version.
 FETCH_ALIASES = ("/", "/fetch")
+# What GET /v1/fetch reads from its query string; every other field needs a POST.
+GET_FIELDS = frozenset({"url", "format", "markdownMode", "render", "resolveGates", "include"})
 # String fields that ask for something the response would then lack: why each is a 400.
 UNSUPPORTED = {"captureXHR": "webfetch does not record the requests a page makes",
                "screenshot": "webfetch returns a page's content, not a picture of it",
@@ -220,6 +222,12 @@ class FetchBody(BaseModel):
             raise ValueError("jsonSchema nests too deeply") from exc
         if len(raw) > MAX_SCHEMA_BYTES:
             raise ValueError(f"jsonSchema is larger than {MAX_SCHEMA_BYTES} bytes")
+        try:
+            # Property names and defaults come back in the response, which is UTF-8.
+            json.dumps(v, ensure_ascii=False).encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError('jsonSchema contains text that is not Unicode (an unpaired surrogate, '
+                             'such as "\\ud83d" alone)') from exc
         if not _root_is_object(v):
             raise ValueError('jsonSchema must be an object schema with "properties" '
                              '(or a root "$ref" to one in "$defs")')
@@ -522,6 +530,13 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
         denied = _auth(request)
         if denied is not None:
             return denied
+        # A body field in the query string is not read here: say so instead of answering as
+        # if it had been (executeJS=true without a render, screenshot=true without a picture).
+        unread = sorted(set(request.query_params) & (set(FetchBody.model_fields) - GET_FIELDS))
+        if unread:
+            return _error(400, "validation_error", f"the GET form reads {', '.join(sorted(GET_FIELDS))}; "
+                          f"send {', '.join(unread)} in the JSON body of a POST", request.state.rid,
+                          issues=[{"field": name, "message": "not read from the query string"} for name in unread])
         try:
             body = FetchBody(url=url, format=format, markdownMode=markdownMode, render=render,
                              resolveGates=resolveGates,
