@@ -200,7 +200,7 @@ Every value carries its source (`"price": "site:steam:[data-price-final]"`,
 `"currency": "microdata:Product.offers.priceCurrency"`, `"headline": "json-ld:BlogPosting.headline"`),
 and a field with no source is `null` and listed in `missing`. Extraction time on the
 server, from the response's `extracted.ms`: median **0.96 ms**, maximum 1.4 ms over the 20 pages
-(on the current code, Nov 18: median 1.3 ms, 19 of the 20 pages under 3 ms, and 18 ms for the
+(on the current code, Nov 18: median 0.8 ms, 19 of the 20 pages under 3 ms, and 7 ms for the
 first page of the run).
 
 ### 4.3 Latency on pages both services fetch: on par
