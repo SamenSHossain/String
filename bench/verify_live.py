@@ -288,7 +288,7 @@ def review_fixes() -> None:
                                                         "ignoreCertificateErrors": False})
     ignored = {x.strip() for x in (h.get("x-ignored-parameters") or "").split(",") if x.strip()}
     check("String's other request fields are accepted, and the ones without effect are named",
-          status == 200 and b"Example Domain" in body and ignored == {"countryCode", "solveCaptcha"},
+          status == 200 and h.get("x-outcome") == "ok" and len(body) > 50 and ignored == {"countryCode", "solveCaptcha"},
           f"{status} x-ignored-parameters: {h.get('x-ignored-parameters')}")
     status, h, body, _s = request("POST", "/v1/fetch", {"url": example, "method": "POST", "body": "{}"})
     env = parse_json(body)

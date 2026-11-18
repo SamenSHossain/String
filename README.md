@@ -16,6 +16,25 @@ curl -s https://samenh--webfetch.modal.run/v1/fetch -H 'Content-Type: applicatio
   -d '{"url":"https://store.steampowered.com/app/1091500/Cyberpunk_2077/","format":"markdown"}'
 ```
 
+## Submission
+
+| | |
+|---|---|
+| **Target** | `https://store.steampowered.com/app/1091500/Cyberpunk_2077/` (Steam, the largest PC game store; its age-gated product pages all behave the same) |
+| **String request ID** | `be660581-c5e8-427e-a594-52acf566a91e` (2026-11-18): HTTP 200, `x-status-code: 200`, and the `/agecheck/` birth-date form instead of the page. With `executeJS: true`: `101e9cd2-9f34-48ca-bb70-12060a7f7fc5`, the same form |
+| **Endpoint** | `https://samenh--webfetch.modal.run/v1/fetch`, running on Modal, deployed by CI from this repository |
+| The same request through it | the product page: 12,919 characters in 0.65 s (`67eadc54-b28a-4a87-a83d-98ac2bc7cd64`); with `executeJS: true`, through the headless browser (`8d71e608-4046-4b6d-8dbb-2ca96a18061e`) |
+
+A second target, one that no request option works around: `https://www.southwest.com/`.
+String returns an empty body (`ebca4324-ef6d-41a0-8b3e-9987b4324a33`) and, with
+`executeJS: true`, 79 characters (`622d9153-3ec8-4d9f-b31a-42e787ab0ae9`); webfetch returns
+the rendered page (`e182bc31-9653-4320-977d-6bceb0b6c55f`, 13,733 characters).
+
+`python3 bench/pair.py` sends the same request to both services and prints both request
+IDs and whether each response is the real page; these four pairs are in
+[`bench/pairs.jsonl`](bench/pairs.jsonl). §1 lists the other targets, §4 the measurements
+and §5 the improvements.
+
 ## 1. Targets String's keyless API returns walls for
 
 Every target was sent to `POST https://request.usestring.ai/v1/fetch` with
@@ -25,7 +44,7 @@ strongest setting without an account; the keyless API accepts only `url`, `forma
 `x-status-code: 200`** and the wall's text as the page. String's docs say a challenge it
 detects "will report `statusCode: 200` on a `502`"; these were not detected. zeit.de came
 back as HTTP 200, `x-status-code: 403`, empty body. The failures reproduce: the same
-requests failed the same way on Nov 10 and Nov 16, and again in the benchmark runs in §4.
+requests failed the same way on Nov 10, 16, 17 and 18, and in the benchmark runs in §4.
 Sizes, final URLs, request IDs and the first 240 characters of every String response are
 in [`bench/string_failures.jsonl`](bench/string_failures.jsonl).
 
@@ -114,7 +133,9 @@ Measured on 2026-11-16 against the deployed endpoint, called from a separate mac
 with String called back to back from the same client. Raw data: [`bench/`](bench)
 (`results_gated.jsonl`, `results_speed.jsonl`, `steam_accuracy.jsonl`); the first run of
 the same day, before the fixes from an independent review, is in
-[`bench/archive/2026-11-16-first-run/`](bench/archive/2026-11-16-first-run).
+[`bench/archive/2026-11-16-first-run/`](bench/archive/2026-11-16-first-run). Re-checked on
+2026-11-18 against the current deployment: the four pairs in the Submission block, the
+Steam accuracy run (§4.2) and the 48 live checks of `bench/verify_live.py`.
 
 ### 4.1 The targets: String 0/10, webfetch 9/10
 
@@ -170,12 +191,17 @@ ground truth already was, and decides "age-gated" itself: the same URL fetched w
 `resolveGates: false` has to land on `/agecheck`. Re-run on Nov 17 from Warsaw, webfetch
 only: **118 / 120**, 52 / 54 on the age-gated games, 66 / 66 on the rest, with the same
 two misses and the same 9 games found gated
-([`bench/steam_accuracy_rerun.jsonl`](bench/steam_accuracy_rerun.jsonl)).
+([`bench/steam_accuracy_rerun.jsonl`](bench/steam_accuracy_rerun.jsonl)). Re-run once more
+on Nov 18, on the current code (after the fixes described at the end of §5): **118 / 120**
+again, with the same two misses
+([`bench/steam_accuracy_final.jsonl`](bench/steam_accuracy_final.jsonl)).
 
 Every value carries its source (`"price": "site:steam:[data-price-final]"`,
 `"currency": "microdata:Product.offers.priceCurrency"`, `"headline": "json-ld:BlogPosting.headline"`),
 and a field with no source is `null` and listed in `missing`. Extraction time on the
-server, from the response's `extracted.ms`: median **0.96 ms**, maximum 1.4 ms over the 20 pages.
+server, from the response's `extracted.ms`: median **0.96 ms**, maximum 1.4 ms over the 20 pages
+(on the current code, Nov 18: median 1.3 ms, 19 of the 20 pages under 3 ms, and 18 ms for the
+first page of the run).
 
 ### 4.3 Latency on pages both services fetch: on par
 
