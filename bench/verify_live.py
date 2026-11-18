@@ -223,6 +223,97 @@ def second_audit() -> None:
           and {"isbn", "upc"} <= set(ex.get("missing") or []), f"{status} {d}")
 
 
+def review_fixes() -> None:
+    """The findings of the review that followed the second audit, and String request compatibility."""
+    print("\nFixes from the review of those fixes:")
+    example = "https://example.com/"
+
+    # $ref fan-out: these two are small on purpose (the unfixed service answers them with
+    # 8,192 and 16,384 paths); with one more property each grows by orders of magnitude.
+    selfref = {"type": "object", "properties": {"name": {"$ref": "#"}, "title": {"$ref": "#"}}}
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": example, "include": [], "jsonSchema": selfref})
+    ex = parse_json(body).get("extracted") or {}
+    check("a schema that refers to itself through name-like properties is not filled inside itself over and over",
+          status == 200 and len(ex.get("missing") or []) <= 16 and len(body) < 20_000,
+          f"{status}, {len(ex.get('missing') or []):,} missing paths, {len(body):,} bytes")
+
+    defs = {f"D{i}": {"type": "object", "properties": {k: {"$ref": f"#/$defs/D{i + 1}"} for k in "abcd"}}
+            for i in range(6)}
+    defs["D6"] = {"type": "object", "properties": {k: {"type": "string"} for k in "abcd"}}
+    chain = {"type": "object", "properties": {"root": {"$ref": "#/$defs/D0"}}, "$defs": defs}
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": example, "include": [], "jsonSchema": chain})
+    ex = parse_json(body).get("extracted") or {}
+    check("a $defs chain that fans out to 16,384 fields stops at the member budget and says so",
+          status == 200 and ex.get("truncated") is True and len(ex.get("missing") or []) <= 10_000,
+          f"{status}, truncated={ex.get('truncated')}, {len(ex.get('missing') or []):,} missing paths, {len(body):,} bytes")
+
+    # class Node(BaseModel): name: str; children: list["Node"] = []; note: Optional[str] = None; kind: str = "page"
+    node = {"$defs": {"Node": {"properties": {
+        "name": {"title": "Name", "type": "string"},
+        "children": {"default": [], "items": {"$ref": "#/$defs/Node"}, "title": "Children", "type": "array"},
+        "note": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None, "title": "Note"},
+        "kind": {"default": "page", "title": "Kind", "type": "string"}},
+        "required": ["name"], "title": "Node", "type": "object"}}, "$ref": "#/$defs/Node"}
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": example, "include": [], "jsonSchema": node})
+    ex = parse_json(body).get("extracted") or {}
+    d = ex.get("data") or {}
+    check("a property the page lacks takes its schema default (a Pydantic model with defaults validates)",
+          status == 200 and d == {"name": "Example Domain", "children": [], "note": None, "kind": "page"}
+          and {"children", "note", "kind"} <= set(ex.get("missing") or []), f"{status} {d}")
+
+    bad = "http://[object Object]/"
+    status, h, body, _s = request("POST", "/v1/fetch", {
+        "url": "https://postman-echo.com/redirect-to?url=" + urllib.request.quote(bad, safe=""), "render": "never"})
+    env = parse_json(body)
+    check("a redirect to something that is not a URL is a 502 invalid_redirect, not a 500",
+          status == 502 and env.get("error") == "invalid_redirect", f"{status} {env.get('error')}")
+    page = '<html><head><meta http-equiv="refresh" content="0;url=//[x"></head><body>moved</body></html>'
+    status, h, body, _s = request("POST", "/v1/fetch", {
+        "url": "https://httpbin.org/base64/" + base64.urlsafe_b64encode(page.encode()).decode(), "render": "never"})
+    env = parse_json(body)
+    check("a meta refresh to something that is not a URL is a 502 invalid_redirect, not a 500",
+          status == 502 and env.get("error") == "invalid_redirect", f"{status} {env.get('error')}")
+
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": "http://lib.ru/", "render": "always", "include": ["text"]})
+    env = parse_json(body)
+    check("browser tier: a KOI8-R page comes back as text, not as UTF-8 read as KOI8-R",
+          status == 200 and (env.get("strategy") or "").startswith("browser") and "Библиотека" in (env.get("text") or "")
+          and env.get("encoding") == "utf-8",
+          f"{status} via {env.get('strategy')}, encoding {env.get('encoding')}/{env.get('encodingSource')}: "
+          f"{' '.join((env.get('text') or '').split())[:40]!r}")
+
+    # A request written for String, sent unchanged.
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": example, "format": "markdown", "method": "get",
+                                                        "solveCaptcha": True, "countryCode": "US",
+                                                        "ignoreCertificateErrors": False})
+    ignored = {x.strip() for x in (h.get("x-ignored-parameters") or "").split(",") if x.strip()}
+    check("String's other request fields are accepted, and the ones without effect are named",
+          status == 200 and b"Example Domain" in body and ignored == {"countryCode", "solveCaptcha"},
+          f"{status} x-ignored-parameters: {h.get('x-ignored-parameters')}")
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": example, "method": "POST", "body": "{}"})
+    env = parse_json(body)
+    fields = {i.get("field") for i in env.get("issues") or []}
+    check("String's method and body: only GET without a body, anything else is a 400 that says so",
+          status == 400 and {"method", "body"} <= fields and "GET" in (env.get("message") or ""),
+          f"{status} {env.get('message')}")
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": example, "actions": [{"type": "click", "selector": "a"}]})
+    env = parse_json(body)
+    check("String's actions (and captureXHR, screenshot) are a 400 naming the field, never silently dropped",
+          status == 400 and "actions" in (env.get("message") or ""), f"{status} {env.get('message')}")
+    answers = [request("POST", path, {"url": example, "format": "markdown"}) for path in ("/v1/fetch", "/", "/fetch")]
+    check("POST / and POST /fetch answer like POST /v1/fetch",
+          all(a[0] == 200 and a[2] == answers[0][2] and a[1].get("x-outcome") == "ok"
+              and "content-security-policy" in a[1] for a in answers),
+          str([(a[0], len(a[2])) for a in answers]))
+
+    status, h, body, _s = request("POST", "/v1/fetch", {
+        "url": "https://store.steampowered.com/app/1091500/Cyberpunk_2077/", "format": "markdown", "markdownMode": "readable"})
+    text = body.decode("utf-8", "replace")
+    check("readable mode keeps a label's value when the value is a link (Steam's Developer and Publisher)",
+          status == 200 and "Developer: [CD PROJEKT RED](" in text and "Publisher: [CD PROJEKT RED](" in text,
+          f"{status}, {len(text):,} chars")
+
+
 def main() -> int:
     print(f"Endpoint: {BASE}\n")
 
@@ -324,6 +415,7 @@ def main() -> int:
           f"{codes} in {time.monotonic() - t0:.1f}s")
 
     second_audit()
+    review_fixes()
 
     failed = [name for ok, name, _ in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")

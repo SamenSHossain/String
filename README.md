@@ -2,10 +2,10 @@
 
 A page-fetching API, deployed on [Modal](https://modal.com), that gets the real page where
 String's keyless `/v1/fetch` returns a consent wall, an age gate or an empty JavaScript
-shell. It accepts String's core request fields (`url`, `format`, `markdownMode`,
-`mainContentOnly`, `jsonSchema`, `executeJS`, `headers`) and returns String's response
-headers (`x-request-id`, `x-status-code`, `x-final-url`), so `format: markdown` calls are
-interchangeable. It adds an explicit outcome for every response, caller-side content
+shell. A request written for String's `POST /v1/fetch` can be sent to it unchanged: it
+takes String's request fields (§6 says what it does with each) and returns String's
+response headers (`x-request-id`, `x-status-code`, `x-final-url`), so `format: markdown`
+calls are interchangeable. It adds an explicit outcome for every response, caller-side content
 checks, a latency breakdown and deterministic structured extraction with per-field
 provenance.
 
@@ -70,7 +70,7 @@ content any visitor gets after the click.
 
 ```
 POST /v1/fetch
-  └─ validate (jsonSchema at most 50 KB, 200 keys, depth 10); SSRF guard (every hop
+  └─ validate (String's request fields; jsonSchema at most 50 KB, 200 keys, depth 10); SSRF guard (every hop
      resolved; private/loopback/link-local/CGNAT/metadata refused, IPv6 forms that embed an
      IPv4 judged by that IPv4; curl pinned to the checked IP with CURLOPT_RESOLVE)
   └─ HTTP tier: curl_cffi with Chrome 152's TLS + HTTP/2 fingerprint; redirects followed by
@@ -80,7 +80,8 @@ POST /v1/fetch
        └─ gate recipes: preset cookies, or act on the redirect / wall page
   └─ decode like a browser: BOM > header > <meta> > UTF-8 > the declared charset with
      U+FFFD for a few bad bytes > charset-normalizer, with the WHATWG Encoding Standard's
-     labels and decoders
+     labels and decoders; a fixed budget of Python-level work per body, whatever its bytes
+     (a browser-tier body is the DOM, so UTF-8)
   └─ classify: ok | challenge | blocked | consent_wall | age_gate | login_wall |
      js_required | empty | rate_limited | not_found | http_error | server_error
        └─ challenge, block or rate limit? retry once with Safari's fingerprint
@@ -96,7 +97,10 @@ POST /v1/fetch
      hydration data; a part that fails on a page is left out and named in `warnings`
   └─ jsonSchema: filled from site extractors > the page's declared main entity
      (JSON-LD/microdata) > page-level meta > other entities, every value with its source;
-     null, never a guess
+     the schema's default or null, never a guess; one fill is bounded in members, work
+     and result size (`extracted.truncated` when a bound was reached)
+  └─ decoding, classification and output rendering run in at most 4 threads per container,
+     inside the request's timeout
 ```
 
 Code: [`webfetch/`](webfetch). Deployment: [`modal_app.py`](modal_app.py) (API) and
@@ -217,9 +221,13 @@ report `fetch, process, total`.
    of a guess. It resolves JSON-LD `@id` references, lists of them included (Yoast's
    authors), and takes schemas as Pydantic emits them: nullable `anyOf`, `$ref`/`$defs`, a
    root `$ref`, and self-referencing models (filled along the page's data, at most 12
-   levels deep). An `Optional` object the page does not carry is `null`, and identifiers
-   (SKU, MPN, GTIN, EAN, UPC, ISBN) are read only from their own keys, never from another
-   key or another entity on the page.
+   levels deep). An `Optional` object the page does not carry is `null`, a property the
+   page has no value for takes its schema `default` (so a Pydantic model with defaults
+   validates; the property is still listed in `missing`), and identifiers (SKU, MPN, GTIN,
+   EAN, UPC, ISBN) are read only from their own keys, never from another key or another
+   entity on the page. One fill is bounded (10,000 members, 1,000,000 characters of
+   result, a fixed amount of work on the page's data): past a bound the rest is `null`
+   and `extracted.truncated` is `true`.
 5. **Escalation only when needed.** Plain HTTP with Chrome's TLS/HTTP2 fingerprint first;
    Safari's fingerprint on a challenge, block or rate limit; headless Chromium when the HTTP
    tier fails to fetch, or returns a challenge, block, rate limit, empty page or JavaScript
@@ -240,7 +248,10 @@ report `fetch, process, total`.
    and invalid bytes follow WHATWG's error rules. A declared charset is kept when only a
    few bytes are invalid (shown as U+FFFD, as in browsers; `encodingSource` ends in
    `-lossy`); when errors are pervasive, the declaration is taken to be wrong and a
-   detector decides. `format: raw` returns the original bytes with the origin's
+   detector decides; it also decides when a legacy multi-byte declaration with few errors
+   reads as mojibake next to its guess (those encodings decode each other's bytes). A
+   browser-tier body is Chromium's DOM, so it is UTF-8 whatever the origin declared.
+   `format: raw` returns the original bytes with the origin's
    `Content-Type`; when that names no charset, webfetch adds the one it decoded with, under
    its browser name (`Shift_JIS`, `EUC-JP`, `windows-1252`, ...).
 9. **Safe to expose.**
@@ -254,8 +265,14 @@ report `fetch, process, total`.
      host, and the rest (`Authorization`, `X-Api-Key`, ...) are named in that attempt's
      `droppedHeaders`.
    - Decoded size, parse size, HTML and JSON nesting depth (page JSON nested deeper than
-     128 levels is skipped), schema size and depth, and concurrent analysis are bounded;
-     patterns that could backtrack are bounded.
+     128 levels is skipped) and schema size and depth are bounded, and so is the work a
+     page or a schema can cause: decoding has a fixed budget of Python-level steps per
+     body, collecting a page's structured data and filling a schema have hard caps
+     (§5.4), and patterns that could backtrack are bounded. Analysis runs in at most 4
+     threads per container; a slot is freed when its thread really ends, and analysis that
+     outlives the request's `timeout` (it always gets at least 2 s) is a `504`.
+   - A redirect or meta refresh to something that is not a URL is a `502`
+     (`invalid_redirect`), like any other destination problem.
    - An unexpected error is a JSON `500` (`internal_error`, with its `requestId`), never a
      bare one, and in a batch it fails only its own item.
    - Fetched pages are served with `Content-Security-Policy: sandbox`.
@@ -267,12 +284,19 @@ report `fetch, process, total`.
 The code and this write-up went through an independent three-part review (security,
 correctness, and every claim checked against the data). Its 53 findings were fixed or, for
 claims, corrected; the commits are titled "Fix the security review's findings" and "Fix the
-correctness review's findings".
+correctness review's findings". A second audit then checked 132 documented behaviours
+against the live endpoint and found 21 defects, and four reviewers with four adversarial
+verifiers went through the fixes for those and confirmed 23 further problems (a
+self-referencing `jsonSchema` of about 130 bytes could exhaust the container's memory;
+hostile pages could cost seconds of CPU; a malformed redirect was a `500`). All of them are
+fixed, and each has a regression test and, where a public page shows it, a live check in
+[`bench/verify_live.py`](bench/verify_live.py).
 
 ## 6. API
 
-`POST /v1/fetch` takes String's core fields (`url`, `format`, `jsonSchema`, `executeJS`,
-`headers`, `markdownMode`, `mainContentOnly`) plus:
+`POST /v1/fetch` (also served at `POST /` and `POST /fetch`) takes String's request body
+(`url`, `format`, `jsonSchema`, `executeJS`, `headers`, `markdownMode`, `mainContentOnly`;
+the rest are in the second table) plus:
 
 | Field | Meaning |
 |---|---|
@@ -285,8 +309,17 @@ correctness review's findings".
 | `jsonSchema` | an object schema with `properties`, or a root `$ref` into `$defs`/`definitions` (what Pydantic emits for self-referencing models); at most 50 KB, 200 keys and nesting depth 10, else `400` |
 | `timeout`, `maxBytes` | budget for the whole request (≤ 90 s) and size cap (≤ 10 MB) |
 
-Fields String has and webfetch does not (`countryCode`, `method`/`body`, `actions`,
-`screenshot`, `captureXHR`, `solveCaptcha`, ...) are rejected with `400`.
+String's other request fields, so that a request written for String can be sent as it is:
+
+| String field | What webfetch does with it |
+|---|---|
+| `method`, `body` | `method` is accepted in any letter case; only `GET` without a `body` is supported, anything else is a `400` that says so |
+| `actions`, `screenshot`, `captureXHR` | accepted when absent, `null`, `false` or `[]`; a value that asks for the feature is a `400` naming the field (the response would not contain what was asked for) |
+| `countryCode`, `solveCaptcha`, `ignoreCertificateErrors`, `requireWSS` | accepted, without effect: one egress region, captchas are never solved (a challenge is reported as `challenge`), certificates are always verified, there is no WebSocket path. When one asks for behaviour webfetch does not have (`countryCode` set, or one of the others `true`), the response names it in `ignoredParameters` and in the `x-ignored-parameters` header |
+
+A field neither service has is a `400`. The JSON envelope and a `jsonSchema` response are
+webfetch's own (String answers a `jsonSchema` request with the extracted object alone;
+here it is `extracted.data`, next to `sources` and `missing`).
 
 Response headers: `x-request-id`, `x-outcome`, `x-final-url`, `x-strategy` and
 `server-timing` on every fetch (after a `fetch_error`, `x-final-url` is the last URL
@@ -295,11 +328,13 @@ answered, so not on a `fetch_error`; `x-gates` only when a gate recipe acted (th
 envelope's `gates` is `[]` otherwise); `x-encoding` with `format: raw`. The JSON envelope
 adds `warnings` (`[{part, message}]`) when a structured part could not be computed from
 the page, and a browser attempt lists the caller headers it did not send in
-`droppedHeaders`.
+`droppedHeaders`. `extracted.truncated` is `true` when a schema fill reached one of its
+bounds (§5.4).
 
 Status codes: `200` means the destination's own answer (its status is in `statusCode`);
 `502` means we could not get past what the destination served, and `outcome` says what it
-was; `504` timeout; `400` invalid input; `403` destination not public (SSRF guard); `415`
+was; `504` timeout (the fetch, or processing the fetched page, did not finish within
+`timeout`); `400` invalid input; `403` destination not public (SSRF guard); `415`
 binary content requested as markdown/text/html (`ok: false`); `429` rate limited; `500`
 `internal_error`, a bug (the body carries the `requestId` to report).
 
@@ -307,12 +342,13 @@ binary content requested as markdown/text/html (`ok: false`); `429` rate limited
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q                                   # 95 tests; a local server emulates the Steam,
+pytest -q                                   # 751 tests; a local server emulates the Steam,
                                             # DPG, ZEIT and Golem gate flows
 python -m webfetch.cli https://www.nu.nl/   # one fetch, JSON line out
 uvicorn --factory webfetch.api:create_app   # local API on :8000
 modal deploy modal_app.py && modal deploy modal_browser.py
-python3 bench/verify_live.py                # 21 pass/fail checks against the live endpoint
+python3 bench/verify_live.py                # 48 pass/fail checks against the live endpoint
+python3 bench/pair.py                       # the same request through String and through webfetch
 ```
 
 Environment: `WEBFETCH_API_KEYS` (comma-separated; when set, every request needs one),
@@ -336,7 +372,8 @@ Environment: `WEBFETCH_API_KEYS` (comma-separated; when set, every request needs
 - **Modal picks the region.** Containers run wherever Modal has capacity: the Nov 16
   benchmarks ran on a US container, and on Nov 17 the endpoint went out through Azure in
   Warsaw. Sites that localise by IP follow the container: Steam shows złoty there, and
-  GTA V has no age gate. There is no `countryCode`. `?cc=us` pins Steam's prices and age
+  GTA V has no age gate. `countryCode` is accepted but has no effect (the response says so
+  in `ignoredParameters`). `?cc=us` pins Steam's prices and age
   rule, and Modal's `region=` option on the functions (not set here) would pin the whole
   deployment. From a container in a country without the gate, Steam's `/agecheck/` sends
   the visitor straight back, so with `resolveGates: false` the fetch loops between `/app/`
@@ -351,7 +388,13 @@ Environment: `WEBFETCH_API_KEYS` (comma-separated; when set, every request needs
   codecs; a UTF-16 label without a byte-order mark is read as UTF-8.
 - **Readable mode is trafilatura's main-content extraction.** `mainContentOnly` /
   `markdownMode: readable` drop asides and footnotes and can flatten code blocks nested in
-  lists; the default mode keeps the whole page.
+  lists; the default mode keeps the whole page. One addition: a label followed by a block
+  that holds a single link (`Developer:` and the studio's link on a Steam page) is kept as
+  one line; a value made of several links is still dropped.
+- **Bounds can cut extremes short.** A schema fill stops at 10,000 members, 1,000,000
+  characters of result or its work budget (`extracted.truncated`); of a list of more than
+  200 JSON-LD `@id` references the first 200 are followed; `links` omits `javascript:`,
+  `vbscript:`, `data:`, `mailto:`, `tel:` and same-page targets.
 - **Extraction reads only what the page carries.** Fields that exist only as free text
   (not in JSON-LD, microdata, meta tags or a site extractor) come back `null`. An LLM
   fallback for those fields, with each value checked against the page text, is the
