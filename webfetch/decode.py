@@ -3,7 +3,8 @@
 Order: byte-order mark, then the HTTP Content-Type charset, then a <meta> prescan of the
 first bytes, then strict UTF-8. A declared charset with only a few bad bytes is then kept,
 each bad sequence shown as U+FFFD (browsers never drop a declared charset over bad bytes);
-pervasive errors mean the declaration is wrong, and charset-normalizer decides.
+pervasive errors mean the declaration is wrong, and charset-normalizer decides. It also
+decides where a legacy multi-byte declaration with few errors reads as mojibake next to its guess.
 
 Labels follow the WHATWG Encoding Standard's table (Shift_JIS -> cp932, GB2312/GBK ->
 GB18030, latin1/ascii -> windows-1252, ...). The decoders follow its indexes and error
@@ -16,8 +17,11 @@ from __future__ import annotations
 import codecs
 import functools
 import re
+import threading
+from _multibytecodec import MultibyteIncrementalDecoder
 
 from charset_normalizer import from_bytes
+from charset_normalizer.md import mess_ratio
 
 _META_RE = re.compile(rb"""<meta[^>]{0,512}?charset\s*=\s*["']?\s*([A-Za-z0-9_.:\-]{1,40})""", re.I)
 _CT_RE = re.compile(r"""charset\s*=\s*["']?\s*([A-Za-z0-9_.:\-]{1,40})""", re.I)
@@ -109,10 +113,23 @@ _BOMS = (
 )
 _FFFD = "\ufffd"
 
+# A page chooses its bytes and its label, so decoding has to cost about the same whatever they
+# are. C code does the work; what runs in Python once per bad or special sequence (the error
+# handlers and the twin scan below) is counted in steps, and a decode gets _MAX_STEPS of them:
+# some tens of milliseconds, and far more than a real page takes. decode_body decodes a body at
+# most four times (for a byte-order mark, the header's charset, the <meta>'s, the detector's guess).
+_MAX_STEPS = 50_000
+_running = threading.local()  # .budget: [steps left] for the decode running on this thread
+
+
+class _GiveUp(Exception):
+    """Raised by an error handler to end a decode whose result would not be used."""
+
+
 # Single-byte encodings, decoded through a 256-entry table: Python's codec, with WHATWG's
 # differences. windows-874 and windows-125x fill their gaps in 0x80-0x9F with the C1 control of
 # the same number; every other byte Python leaves undefined is undefined in WHATWG's index too
-# (an error, U+FFFD), except for the entries below.
+# (an error, U+FFFD, which the table holds: no handler runs), except for the entries below.
 _SINGLE_BYTE = {"cp866", "iso8859-2", "iso8859-3", "iso8859-4", "iso8859-5", "iso8859-6", "iso8859-7", "iso8859-8",
                 "iso8859-10", "iso8859-13", "iso8859-14", "iso8859-15", "iso8859-16", "koi8-r", "koi8-u", "mac-roman",
                 "cp874", "cp1250", "cp1251", "cp1252", "cp1253", "cp1254", "cp1255", "cp1256", "cp1257", "cp1258",
@@ -127,7 +144,7 @@ def _byte_table(codec: str) -> str:
         try:
             chars.append(bytes((b,)).decode(codec))
         except UnicodeDecodeError:
-            chars.append(chr(b) if 0x80 <= b <= 0x9F else "\ufffe")  # undefined: decodes as U+FFFD
+            chars.append(chr(b) if 0x80 <= b <= 0x9F else _FFFD)
     for b, ch in _SINGLE_BYTE_FIXES.get(codec, {}).items():
         chars[b] = ch
     return "".join(chars)
@@ -182,6 +199,12 @@ def _after_lead(data: bytes, i: int) -> tuple[str, int]:
 def _whatwg_errors(err: UnicodeDecodeError) -> tuple[str, int]:
     # Python's CJK codecs report a bad sequence at its first byte, whatever its length.
     data, i, codec = err.object, err.start, err.encoding
+    budget = _running.budget
+    if budget[0] <= 0:
+        # Out of steps: the rest in one piece by Python's codec alone, so with its tables and one
+        # U+FFFD per bad byte. All of the input is still decoded, and the errors still count.
+        return data[i:].decode(codec, "replace"), len(data)
+    budget[0] -= 1
     b = data[i]
     if codec == "euc_jp":
         t = data[i + 1] if i + 1 < len(data) else -1
@@ -212,8 +235,30 @@ def _whatwg_errors(err: UnicodeDecodeError) -> tuple[str, int]:
     return _after_lead(data, i) if is_lead else (_FFFD, i + 1)
 
 
-_ERRORS = "webfetch-whatwg"  # error handler names are process-wide
+def _whatwg_clean(err: UnicodeDecodeError) -> tuple[str, int]:
+    """_whatwg_errors for a caller that wants the text only if it has no errors."""
+    out = _whatwg_errors(err)
+    if out[0] == _FFFD:
+        raise _GiveUp
+    return out
+
+
+def _replace_errors(err: UnicodeDecodeError) -> tuple[str, int]:
+    """"replace" for Python's other decoders. Its CJK codecs replace inside their C loop; the rest
+    (UTF-16, UTF-32, charmap tables) call the handler for every bad sequence, a few million times
+    a second. Text with more bad sequences than the budget is not in that encoding."""
+    budget = _running.budget
+    if budget[0] <= 0:
+        raise _GiveUp
+    budget[0] -= 1
+    return _FFFD, err.end
+
+
+# Error handler names are process-wide.
+_ERRORS, _CLEAN, _REPLACE = "webfetch-whatwg", "webfetch-whatwg-clean", "webfetch-replace"
 codecs.register_error(_ERRORS, _whatwg_errors)
+codecs.register_error(_CLEAN, _whatwg_clean)
+codecs.register_error(_REPLACE, _replace_errors)
 
 # Characters Python's tables give for a symbol where WHATWG's index (which follows Windows) has
 # another code point. Each source character comes from that one byte sequence only.
@@ -247,39 +292,51 @@ _TWINS = {
 _TWIN_RE = {codec: re.compile(b"|".join(map(re.escape, chars))) for codec, (chars, _) in _TWINS.items()}
 
 
-def _decode_twins(data: bytes, codec: str) -> str:
+def _decode_twins(data: bytes, codec: str, errors: str) -> str:
     chars, inside = _TWINS[codec]
-    dec = codecs.getincrementaldecoder(codec)(_ERRORS)
+    dec = codecs.getincrementaldecoder(codec)(errors)
+    budget = _running.budget
     out, pos = [], 0
     for m in _TWIN_RE[codec].finditer(data):
+        if budget[0] <= 0:  # the twins that are left decode as Python has them
+            break
+        budget[0] -= 1
         out.append(dec.decode(data[pos:m.start()]))
         pending = dec.getstate()[0]
         if inside(pending):
             out.append(dec.decode(m.group()))
         else:  # pending bytes, if any, start no character: decode them as the errors they are
             dec.reset()
-            out.append(pending.decode(codec, _ERRORS) + chars[m.group()])
+            out.append(pending.decode(codec, errors) + chars[m.group()])
         pos = m.end()
     out.append(dec.decode(data[pos:]))
     # The tail, decoded in one go: with final=True, CPython's incremental CJK decoders keep the
     # bytes after an error at the end pending instead of decoding them.
-    out.append(dec.getstate()[0].decode(codec, _ERRORS))
+    out.append(dec.getstate()[0].decode(codec, errors))
     return "".join(out)
 
 
-def _decode_multibyte(data: bytes, codec: str) -> str:
+def _decode_multibyte(data: bytes, codec: str, errors: str) -> str:
     if codec in _TWIN_RE and _TWIN_RE[codec].search(data):
-        text = _decode_twins(data, codec)
+        text = _decode_twins(data, codec, errors)
     else:
-        text = data.decode(codec, _ERRORS)
+        text = data.decode(codec, errors)
     for src, dst in _REMAP.get(codec, ()):
         if src in text:
             text = text.replace(src, dst)
     return text
 
 
-def _decode(data: bytes, enc: str) -> tuple[str, int] | None:
-    """Decode the WHATWG way: ``(text, number of errors)``, or None if the codec is unusable."""
+def _inline_replace(enc: str) -> bool:
+    decoder = codecs.lookup(enc).incrementaldecoder
+    return isinstance(decoder, type) and issubclass(decoder, MultibyteIncrementalDecoder)
+
+
+def _decode(data: bytes, enc: str, clean: bool = False, steps: int = _MAX_STEPS) -> tuple[str, int] | None:
+    """Decode the WHATWG way: ``(text, number of errors)``, or None if the codec is unusable
+    (for this body: see _replace_errors). A caller that uses the text only if it has no errors
+    says `clean`, and may get None for text with errors."""
+    _running.budget = [steps]
     try:
         if enc == "utf-8":
             try:
@@ -287,12 +344,12 @@ def _decode(data: bytes, enc: str) -> tuple[str, int] | None:
             except UnicodeDecodeError:
                 text = data.decode("utf-8", "replace")  # one U+FFFD per maximal bad subpart, as WHATWG
         elif enc in ("euc_jp", "big5hkscs", "cp932", "cp949"):
-            text = _decode_multibyte(data, enc)
+            text = _decode_multibyte(data, enc, _CLEAN if clean else _ERRORS)
         elif enc in _SINGLE_BYTE:
-            text = codecs.charmap_decode(data, "replace", _byte_table(enc))[0]
+            text = codecs.charmap_decode(data, "strict", _byte_table(enc))[0]
         else:
-            text = data.decode(enc, "replace")
-    except (LookupError, UnicodeError, ValueError):
+            text = data.decode(enc, "replace" if _inline_replace(enc) else _REPLACE)
+    except (LookupError, UnicodeError, ValueError, _GiveUp):
         return None
     errors = text.count(_FFFD)
     if errors and enc == "utf-8":
@@ -300,13 +357,42 @@ def _decode(data: bytes, enc: str) -> tuple[str, int] | None:
     return text, errors
 
 
+def _decoded_chars(text: str, errors: int) -> int:
+    """The non-ASCII characters that decoded: what speaks for the charset the text was decoded with."""
+    return len(text) - len(text.encode("ascii", "ignore")) - errors
+
+
 def _few_errors(text: str, errors: int) -> bool:
     """A declared charset with a few bad bytes stays, as in browsers; pervasive errors mean the
     declaration is wrong (e.g. a utf-8 header over cp1251 bytes)."""
-    if errors <= 2:
-        return True
-    decoded = len(text) - len(text.encode("ascii", "ignore")) - errors  # non-ASCII characters that decoded
-    return decoded >= 4 * errors
+    return errors <= 2 or _decoded_chars(text, errors) >= 4 * errors
+
+
+# The legacy multi-byte encodings share their byte ranges: text in one decodes in another as
+# other characters, with an error only here and there. For these, few errors do not show that a
+# declaration is right; how the text reads does.
+_CROSS_DECODING = {"euc_jp", "big5hkscs", "cp932", "cp949", "gb18030"}
+_HIGH_BYTE = re.compile(rb"[\x80-\xff]")
+_TEXT_RUN = re.compile(r"[^\x00-\x7f][^<>]{0,300}")  # non-ASCII text, to the end of its text node
+
+
+def _reads_better(data: bytes, guess: str | None, enc: str) -> bool:
+    """Whether the detector's guess makes clearly better text of the body than `enc`, a declared
+    charset that decoded it with few errors. Judged by charset-normalizer's measure of mojibake
+    (0 for clean text, 0.2 where the detector itself gives a decoding up), on the same stretch of
+    the body, so that stray bytes in a correctly declared page cost both readings alike."""
+    if guess is None or guess == enc:
+        return False
+    start = _HIGH_BYTE.search(data)
+    start = start.start() if start else 0
+    mess = []
+    for codec in (enc, guess):
+        decoded = _decode(data[start:start + 100_000], codec, steps=1_000)  # a sample: it need not be exact
+        runs = "\n".join(_TEXT_RUN.findall(decoded[0])).replace(_FFFD, "")[:16_000] if decoded else ""
+        if len(runs) - len(runs.encode("ascii", "ignore")) < 16:  # too little text to judge by
+            return False
+        mess.append(mess_ratio(runs))
+    return mess[0] - mess[1] >= 0.1
 
 
 def normalize_label(label: str | None) -> str | None:
@@ -358,7 +444,9 @@ def decode_body(data: bytes, content_type: str | None = None) -> tuple[str, str,
         return "", "utf-8", "empty"
     for bom, enc in _BOMS:
         if data.startswith(bom):
-            return data[len(bom):].decode(enc, errors="replace"), enc, "bom"
+            decoded = _decode(data[len(bom):], enc)
+            if decoded is not None:
+                return decoded[0], enc, "bom"
 
     candidates: list[tuple[str, str]] = []
     header = charset_from_content_type(content_type)
@@ -368,32 +456,54 @@ def decode_body(data: bytes, content_type: str | None = None) -> tuple[str, str,
     if meta and meta not in {c for c, _ in candidates}:
         candidates.append((meta, "meta"))
 
-    lossy = []
+    try:
+        utf8 = data.decode("utf-8")
+    except UnicodeDecodeError:
+        utf8 = None
+
+    lossy: dict[str, tuple[str, int, str]] = {}
     for enc, source in candidates:
-        decoded = _decode(data, enc)
+        if utf8 is not None and enc == "utf-8":
+            return utf8, enc, source
+        # A single-byte decoder takes nearly any bytes: that a <meta> naming one finds no error
+        # says nothing against a UTF-8 header. Where text decoded as UTF-8 and little did not,
+        # the header stays (below); bytes of which nothing did are left to the <meta>.
+        if enc in _SINGLE_BYTE and "utf-8" in lossy and _decoded_chars(*lossy["utf-8"][:2]) >= 4 * lossy["utf-8"][1]:
+            break
+        # Valid UTF-8 is what the body is unless a declaration decodes it without a single error
+        # (a browser shows that decoding), so there a decode can end at its first error.
+        decoded = _decode(data, enc, clean=utf8 is not None)
         if decoded is None:
             continue
         if not decoded[1]:
             return decoded[0], enc, source
-        lossy.append((*decoded, enc, source))
+        lossy[enc] = (*decoded, source)
 
-    if all(enc != "utf-8" for _, _, enc, _ in lossy):  # else known to have errors
-        try:
-            return data.decode("utf-8"), "utf-8", "utf-8-valid"
-        except UnicodeDecodeError:
-            pass
+    if utf8 is not None:
+        # The escape-based encodings are ASCII, so valid UTF-8 too, whatever the escapes say:
+        # where one decoded text, a few errors in it do not make the page UTF-8.
+        for enc, (text, errors, source) in lossy.items():
+            if enc.startswith(("iso2022", "hz")) and _few_errors(text, errors) and _decoded_chars(text, errors):
+                return text, enc, source + "-lossy"
+        return utf8, "utf-8", "utf-8-valid"
 
-    for text, errors, enc, source in lossy:
-        if _few_errors(text, errors):
+    detected: list[str | None] = []  # the detector's guess, asked for at most once
+
+    def guess() -> str | None:
+        if not detected:
+            best = from_bytes(data[:500_000]).best()
+            detected.append(normalize_label(best.encoding) if best is not None and best.encoding else None)
+        return detected[0]
+
+    for enc, (text, errors, source) in lossy.items():
+        if _few_errors(text, errors) and not (enc in _CROSS_DECODING and _reads_better(data, guess(), enc)):
             return text, enc, source + "-lossy"  # the declared charset, with U+FFFD for the bad bytes
 
-    best = from_bytes(data[:500_000]).best()
-    enc = normalize_label(best.encoding) if best is not None and best.encoding else None
-    decoded = _decode(data, enc) if enc else None
+    enc = guess()
+    decoded = lossy.get(enc) or (_decode(data, enc) if enc else None)
     if decoded is not None:
         return decoded[0], enc, "detected"
 
-    if lossy:
-        text, _, enc, source = lossy[0]
+    for enc, (text, _, source) in lossy.items():
         return text, enc, source + "-lossy"
     return _decode(data, "cp1252")[0], "cp1252", "fallback"

@@ -161,7 +161,12 @@ async def _bounded(fn, *args):
 
 def _analyze(result: FetchResult, expect: Expect | None) -> Page:
     ctype = result.headers.get("content-type", "")
-    text, enc, enc_src = decode_body(result.body, ctype)
+    if result.extra.get("browser"):
+        # Chromium decoded the page, and the body is its DOM in UTF-8 (see _browser_result). The
+        # DOM still carries the page's <meta charset>, which says nothing about these bytes.
+        text, enc, enc_src = result.body.decode("utf-8", "replace"), "utf-8", "browser"
+    else:
+        text, enc, enc_src = decode_body(result.body, ctype)
     if len(text) > MAX_PARSE_CHARS:
         text = text[:MAX_PARSE_CHARS]
     _check_nesting(text)
@@ -227,11 +232,17 @@ def _browser_result(url: str, data: dict[str, Any], gates: list[GateEvent]) -> F
     hops = [Hop(str(h.get("url") or ""), int(h.get("status") or 0), h.get("location"), float(h.get("ms") or 0.0))
             for h in data.get("redirects") or [] if isinstance(h, dict)]
     hops.append(Hop(final_url, status, None, 0.0))
+    headers = {k.lower(): v for k, v in (data.get("headers") or {}).items()}
+    # The body below is the DOM as text, in UTF-8, not the bytes the origin sent: its Content-Type
+    # (the envelope's contentType, and the header of format raw) names that charset, not theirs.
+    params = [p.strip() for p in str(headers.get("content-type") or "").split(";")]
+    params = [p for p in params if p and not p.lower().replace(" ", "").startswith("charset=")]
+    headers["content-type"] = "; ".join([*(params or ["text/html"]), "charset=utf-8"])
     return FetchResult(
         requested_url=normalize_url(url).url,
         final_url=final_url,
         status=status,
-        headers={k.lower(): v for k, v in (data.get("headers") or {}).items()},
+        headers=headers,
         body=html.encode("utf-8"),
         http_version=str(data.get("httpVersion") or ""),
         remote_ip=data.get("remoteIp") or "",

@@ -121,6 +121,12 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/agecheck/app/271590"):
                 return self._send(200, AGECHECK_PAGE)
 
+        if path == "/encoded":  # ?codec=<Python codec>&text=<words>[&header=<label>][&meta=<label>], on every host
+            meta = f'<meta charset="{qs["meta"][0]}">' if "meta" in qs else ""
+            body = f"<html><head>{meta}<title>Encoded</title></head><body><p>{qs['text'][0] * 30}</p></body></html>"
+            ctype = "text/html" + (f"; charset={qs['header'][0]}" if "header" in qs else "")
+            return self._send(200, body.encode(qs["codec"][0]), headers={"Content-Type": ctype})
+
         if host == "www.nu.nl":
             if path == "/privacy-gate/accept":
                 if not qs.get("authId"):
