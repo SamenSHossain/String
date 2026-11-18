@@ -1,9 +1,11 @@
 """FastAPI application.
 
-``POST /v1/fetch`` accepts the same core body as String's ``/v1/fetch`` (``url``,
-``format``, ``jsonSchema``, ``executeJS``, ``headers``, ``markdownMode``,
-``mainContentOnly``) and answers with the same headers (``x-request-id``,
-``x-status-code``, ``x-final-url``), so a String client can point at it unchanged.
+``POST /v1/fetch`` accepts the body of String's ``/v1/fetch`` and answers with the same
+headers (``x-request-id``, ``x-status-code``, ``x-final-url``), so a String client can
+point at it unchanged. String's fields for what webfetch does not do are either refused
+with a 400 (the response would lack what was asked for: ``method``/``body``,
+``captureXHR``, ``screenshot``, ``actions``) or accepted and reported back as ignored
+(``countryCode``, ``solveCaptcha``, ``ignoreCertificateErrors``, ``requireWSS``).
 """
 
 from __future__ import annotations
@@ -43,6 +45,15 @@ MAX_SCHEMA_KEYS = 200
 MAX_SCHEMA_DEPTH = 10
 MAX_BATCH = 20
 BROWSER_COST = 5  # a headless-browser render uses ~5x the resources of an HTTP fetch
+# A String client that posts to the service URL itself, or to it without the version.
+FETCH_ALIASES = ("/", "/fetch")
+# String fields that ask for something the response would then lack: why each is a 400.
+UNSUPPORTED = {"captureXHR": "webfetch does not record the requests a page makes",
+               "screenshot": "webfetch returns a page's content, not a picture of it",
+               "actions": "webfetch does not script the browser"}
+# String fields that are accepted without effect, and the value of each that asks for
+# what webfetch does not do (None: any value). A request that sends one is told so.
+IGNORED = {"countryCode": None, "solveCaptcha": True, "ignoreCertificateErrors": True, "requireWSS": True}
 
 
 def _schema_size(node: Any) -> tuple[int, int]:
@@ -121,6 +132,53 @@ class FetchBody(BaseModel):
     cookies: dict[str, str] | None = None
     timeout: float | None = Field(None, gt=0, le=90)
     maxBytes: int | None = Field(None, gt=0, le=10 * 1024 * 1024)
+    method: str | None = Field("GET", description="String compatibility. Only GET, in any letter case: webfetch "
+                                                  "only reads pages, so any other method is a 400.")
+    body: Any = Field(None, description="String compatibility. Must be absent or null: webfetch sends no request "
+                                        "body, so any value is a 400.")
+    captureXHR: bool | dict[str, Any] | None = Field(
+        None, description="String compatibility. Not supported: false or null is accepted, anything else "
+                          "(true, {} or filters) is a 400.")
+    screenshot: bool | None = Field(None, description="String compatibility. Not supported: false or null is "
+                                                      "accepted, true is a 400.")
+    actions: list[Any] | None = Field(None, description="String compatibility. Not supported: null or an empty "
+                                                        "list is accepted, any action is a 400.")
+    countryCode: str | None = Field(
+        None, min_length=2, max_length=2,
+        description="String compatibility. Accepted without effect (webfetch has one egress region) and listed "
+                    "in the response's ignoredParameters.")
+    solveCaptcha: bool | None = Field(
+        None, description="String compatibility. Captchas are never solved (a challenge is reported as outcome "
+                          "`challenge`): true is accepted without effect and listed in ignoredParameters.")
+    ignoreCertificateErrors: bool | None = Field(
+        None, description="String compatibility. Certificates are always verified: true is accepted without "
+                          "effect and listed in ignoredParameters.")
+    requireWSS: bool | None = Field(
+        None, description="String compatibility. There is no WebSocket fetch path: true is accepted without "
+                          "effect and listed in ignoredParameters.")
+
+    @field_validator("method")
+    @classmethod
+    def _method(cls, v):
+        if v is not None and v.upper() != "GET":
+            raise ValueError(f"method {v[:16]!r} is not supported: webfetch only reads pages with GET")
+        return v
+
+    @field_validator("body")
+    @classmethod
+    def _body(cls, v):
+        if v is not None:
+            raise ValueError("request bodies are not supported: webfetch only reads pages with GET")
+        return v
+
+    @field_validator(*UNSUPPORTED, mode="before")
+    @classmethod
+    def _unsupported(cls, v, info):
+        # Only a value that plainly asks for nothing passes; whatever else was sent, the
+        # answer is the same. {} does ask: String reads captureXHR {} as "capture everything".
+        if v is None or v is False or v == []:
+            return None
+        raise ValueError(f"{info.field_name} is not supported: {UNSUPPORTED[info.field_name]}")
 
     @field_validator("include")
     @classmethod
@@ -166,6 +224,11 @@ class FetchBody(BaseModel):
             raise ValueError('jsonSchema must be an object schema with "properties" '
                              '(or a root "$ref" to one in "$defs")')
         return v
+
+    def ignored(self) -> list[str]:
+        """The String fields this request set to a value that changes nothing here."""
+        return [name for name, asks in IGNORED.items()
+                if (value := getattr(self, name)) is not None and asks in (None, value)]
 
     def to_options(self) -> FetchOptions:
         render = self.render
@@ -243,8 +306,14 @@ def _error(status: int, error: str, message: str, rid: str, **extra) -> JSONResp
                         headers={"x-request-id": rid})
 
 
-def _security_headers(path: str) -> dict[str, str]:
-    if not path.startswith("/v1/"):
+def _is_api(request: Request) -> bool:
+    """A fetch route under any of its names (GET / is the index, so the method counts)."""
+    path = request.url.path
+    return path.startswith("/v1/") or (request.method == "POST" and path in FETCH_ALIASES)
+
+
+def _security_headers(request: Request) -> dict[str, str]:
+    if not _is_api(request):
         return {}
     # Fetched pages are third-party content: never let them run on this origin.
     return {"content-security-policy": "sandbox; default-src 'none'", "x-content-type-options": "nosniff",
@@ -312,7 +381,7 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
         log.error(json.dumps({"rid": rid, "path": request.url.path, "status": 500, "error": type(exc).__name__}),
                   exc_info=exc)
         resp = _error(500, "internal_error", _internal_message(exc), rid)
-        resp.headers.update(_security_headers(request.url.path))
+        resp.headers.update(_security_headers(request))
         return resp
 
     @app.middleware("http")
@@ -324,8 +393,8 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
         ms = round((time.monotonic() - t0) * 1000, 1)
         response.headers["x-request-id"] = rid
         response.headers["x-request-duration-ms"] = str(ms)
-        response.headers.update(_security_headers(request.url.path))
-        if request.url.path.startswith("/v1/"):
+        response.headers.update(_security_headers(request))
+        if _is_api(request):
             log.info(json.dumps({"rid": rid, "path": request.url.path, "status": response.status_code,
                                  "outcome": response.headers.get("x-outcome"), "ms": ms}))
         return response
@@ -352,6 +421,11 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
     async def _do_fetch(body: FetchBody, rid: str, client: str = "anonymous") -> Response:
         opts = body.to_options()
         opts.client = client
+        # Every answer to a request that set a field webfetch ignores says so, in the JSON
+        # body and, since most formats have none, in a header.
+        ignored = body.ignored()
+        told = {"ignoredParameters": ignored} if ignored else {}
+        told_hdrs = {"x-ignored-parameters": ", ".join(ignored)} if ignored else {}
         try:
             target = normalize_url(opts.url)
             if settings.proxy is None:
@@ -361,14 +435,15 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
                 except InvalidUrl:
                     pass  # DNS failure: the fetch itself reports it as dns_error
             env = await run_fetch(opts, fetcher, app.state.browser)
-        except InvalidUrl as exc:
-            return _error(400, "invalid_url", str(exc), rid)
-        except BlockedDestination as exc:
-            return _error(403, "blocked_destination", str(exc), rid)
+        except (InvalidUrl, BlockedDestination) as exc:
+            refused = (400, "invalid_url") if isinstance(exc, InvalidUrl) else (403, "blocked_destination")
+            resp = _error(*refused, str(exc), rid, **told)
+            resp.headers.update(told_hdrs)
+            return resp
         raw = env.pop("_raw", None)
-        env = {"requestId": rid, **env}
+        env = {"requestId": rid, **env, **told}
         outcome = env.get("outcome", "")
-        hdrs = {"x-request-id": rid, "x-outcome": outcome}
+        hdrs = {"x-request-id": rid, "x-outcome": outcome, **told_hdrs}
         if "statusCode" in env:
             hdrs["x-status-code"] = str(env["statusCode"])
         if env.get("finalUrl"):
@@ -418,6 +493,7 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
             "endpoints": {
                 "POST /v1/fetch": "fetch one URL (JSON body; String /v1/fetch compatible)",
                 "GET /v1/fetch?url=...&format=markdown": "same, as a GET",
+                "POST / and POST /fetch": "aliases of POST /v1/fetch",
                 "POST /v1/batch": f"up to {MAX_BATCH} fetches in one call",
                 "GET /docs": "interactive OpenAPI docs",
             },
@@ -432,6 +508,8 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
         return {"ok": True, "version": __version__, "browser": app.state.browser is not None}
 
     @app.post("/v1/fetch")
+    @app.post("/", include_in_schema=False)
+    @app.post("/fetch", include_in_schema=False)
     async def fetch_post(body: FetchBody, request: Request):
         denied = _auth(request, cost=BROWSER_COST if body.to_options().render == "always" else 1)
         if denied is not None:
@@ -485,6 +563,8 @@ def create_app(settings: Settings | None = None, browser: BrowserClient | None =
                                       "error": type(res).__name__}), exc_info=res)
                 res = {"httpStatus": 500, "error": "internal_error", "message": _internal_message(res),
                        "requestId": f"{rid}:{i}"}
+                if item.ignored():
+                    res["ignoredParameters"] = item.ignored()
             res.setdefault("url", item.url)  # error items say which request they answer
             results.append(res)
         return JSONResponse({"requestId": rid, "ms": round((time.monotonic() - t0) * 1000, 1),

@@ -20,6 +20,7 @@ _WS = re.compile(r"\s+")
 _URL_STRIP = "".join(map(chr, range(0x21)))
 _URL_TAB_NL = str.maketrans("", "", "\t\n\r")
 _NOT_RESOLVED = ("javascript:", "data:", "mailto:", "tel:")
+_NOT_LINKS = (*_NOT_RESOLVED, "vbscript:", "#")  # nowhere to go: scripts, inline data, same-page anchors
 # Consent banners and similar overlays that survive in fetched HTML.
 _OVERLAY_SELECTORS = [
     "#onetrust-consent-sdk", "#onetrust-banner-sdk", "#CybotCookiebotDialog", "#usercentrics-root",
@@ -137,10 +138,12 @@ _JSON_NOISE = bytes(c for c in range(256) if c not in b'"[]{}')
 _JSON_STEP = {ord("["): 1, ord("{"): 1, ord("]"): -1, ord("}"): -1}
 # "\ud83d" alone (a string cut mid-emoji, as JSON.stringify writes it) parses into a str
 # that cannot be encoded as UTF-8, so the response could not be written. Lone surrogates
-# become U+FFFD; escaped backslashes are matched as pairs so "\\ud83d" is left alone.
-_U_ESCAPE = re.compile(r"\\\\"  # an escaped backslash: kept
-                       r"|\\u[dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}"  # a pair: kept
-                       r"|\\u[dD][89a-fA-F][0-9a-fA-F]{2}")  # a lone surrogate: replaced
+# become U+FFFD: a high one that no low one follows, a low one that no high one precedes.
+# The pattern matches nothing else, so the substitution needs no call per match, and both
+# branches sit behind the literal "\u": the scan jumps from one escape to the next.
+_HIGH, _LOW = r"\\u[dD][89abAB][0-9a-fA-F]{2}", r"\\u[dD][c-fC-F][0-9a-fA-F]{2}"
+_LONE_SURROGATE = re.compile(rf"\\u[dD](?:[89abAB][0-9a-fA-F]{{2}}(?!{_LOW})"
+                             rf"|(?<!{_HIGH}\\u[dD])[c-fC-F][0-9a-fA-F]{{2}})")
 
 
 def _json_depth(raw: str) -> int:
@@ -165,7 +168,10 @@ def _loads_lenient(raw: str) -> Any:
     if _json_depth(raw) > MAX_JSON_DEPTH:
         return None
     if "\\ud" in raw or "\\uD" in raw:
-        raw = _U_ESCAPE.sub(lambda m: "\\ufffd" if len(m.group()) == 6 else m.group(), raw)
+        # Escaped backslashes first, written as the escape that has none in it (JSON pairs
+        # them from the left, as replace does): every backslash left starts an escape, so
+        # the "\ud83d" in "\\ud83d" is not taken for one.
+        raw = _LONE_SURROGATE.sub(r"\\ufffd", raw.replace("\\\\", "\\u005c"))
     try:
         return json.loads(raw, parse_constant=_no_constant, parse_float=_finite)
     except (ValueError, RecursionError):  # JSONDecodeError, or an integer over 4,300 digits
@@ -313,8 +319,9 @@ def links(tree: LexborHTMLParser, base_url: str, limit: int = 2000) -> list[dict
     out, seen = [], set()
     base = document_base(tree, base_url)
     for a in tree.css("a[href]"):
-        href = (a.attributes.get("href") or "").strip()
-        if not href or href.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
+        # The scheme is read as a browser reads it: "java\tscript:" and "\x01javascript:" are scripts.
+        href = (a.attributes.get("href") or "").strip(_URL_STRIP).translate(_URL_TAB_NL)
+        if not href or href.lower().startswith(_NOT_LINKS):
             continue
         url = _resolve(base, href)
         if url is None or url in seen:
@@ -354,21 +361,81 @@ def to_text(html: str) -> str:
     return h2m.convert(html, opts).content.strip() + "\n"
 
 
+# URLs that urljoin would parse only to put back together: an absolute one it returns as
+# written, or a relative one that is appended as written to a part of the base. Which part
+# depends only on how the reference starts (groups 1-4: "/", "./" or up to eight "../";
+# nothing; "?"; "#"), so it is computed once per start. Anything urljoin treats specially is
+# left to it: other "." and ".." segments, empty segments, ";", a bare "?" or "#", a first
+# segment with a colon (a scheme), spaces and controls, a host outside the plain ASCII set.
+_SEG = r"(?!\.{1,2}(?:[/?#]|\Z))[^/?#;\x00-\x20]+"
+_PATH = rf"{_SEG}(?:/{_SEG})*/?"
+_TAIL = r"(?:\?[^#\x00-\x20]+)?(?:\#[^\x00-\x20]+)?"
+_PLAIN_URL = re.compile(rf"https?://[\w.~%:@-]+(?:/[^?#;\x00-\x20]*)?{_TAIL}"
+                        rf"|((?:\.\./){{1,8}}|\./|/)(?:{_PATH})?{_TAIL}"
+                        rf"|()(?![^/?#]*:){_PATH}{_TAIL}"
+                        rf"|(\?)[^#\x00-\x20]+(?:\#[^\x00-\x20]+)?"
+                        rf"|(\#)[^\x00-\x20]+", re.ASCII)
+# Distinct URLs per page that are resolved by parsing them (about 6 µs each); the rest of a
+# page that has more keeps what trafilatura makes of them. Plain ones are not counted.
+MAX_PARSED_URLS = 20_000
+
+
 def _absolutize(tree, page_url: str) -> None:
     """Resolve link and image URLs in trafilatura's (lxml) tree the way a browser would.
 
     trafilatura resolves hrefs against scheme://host only: ../x.html loses its directory,
     #frag points at the site root, //host/x becomes http:, and <base href> is ignored.
-    Its images prefer data-src over src, so both are resolved."""
+    Its images prefer data-src over src, so both are resolved. This runs over every link
+    of the page, kept or not, so the common shapes take a prefix lookup, not a urljoin."""
     href = next((b.get("href") for b in tree.iter("base") if b.get("href") is not None), None)
     base = _base_from(href, page_url)
+    prefixes: dict[str, str | None] = {}  # start of a plain reference (13 exist) -> what it is appended to
+    parsed: dict[str, str | None] = {}  # any other value -> its resolution
     for node in tree.iter("a", "img"):
         for attr in ("href",) if node.tag == "a" else ("src", "data-src"):
             value = node.get(attr)
-            if value and not value.lstrip(_URL_STRIP).lower().startswith(_NOT_RESOLVED):
-                url = _resolve(base, value)
-                if url:
-                    node.set(attr, url)
+            if not value:
+                continue
+            plain = _PLAIN_URL.fullmatch(value)
+            if plain is None:
+                if value.lstrip(_URL_STRIP).lower().startswith(_NOT_RESOLVED):
+                    continue
+                if value not in parsed:
+                    if len(parsed) >= MAX_PARSED_URLS:
+                        continue
+                    parsed[value] = _resolve(base, value)
+                url = parsed[value]
+            elif plain.lastindex is None:
+                continue  # absolute already
+            else:
+                start = plain.group(plain.lastindex)
+                if start not in prefixes:
+                    probe = _resolve(base, start + "x")
+                    prefixes[start] = probe and probe[:-1]
+                url = prefixes[start] and prefixes[start] + value[len(start):]
+            if url:
+                node.set(attr, url)
+
+
+def _join_labelled_links(tree) -> None:
+    """Write a label and its value as one paragraph when the value is a block that holds
+    one link and nothing else: "Developer:" and, in the next block, the studio's link.
+
+    trafilatura judges each block by its share of link text: such a value is all link and
+    goes out as navigation, which leaves the label with nothing after it. As one paragraph
+    the pair is what "<p>Developer: <a>...</a></p>" already was: a line of text with a
+    link in it, kept or dropped as a whole. Only div and p are judged that way, so lists
+    and tables are not touched; a row of several links stays what it was, navigation."""
+    for value in list(tree.iter("div", "p")):
+        label = value.getprevious()
+        if (label is None or label.tag not in ("div", "p") or len(label) or (label.tail or "").strip()
+                or len(value) != 1 or value[0].tag != "a" or (value.text or "").strip() or (value[0].tail or "").strip()):
+            continue
+        name = (label.text or "").strip()
+        if name.endswith((":", "：")) and len(name) <= 40 and len(value.text_content()) <= 100:  # a label, a name
+            label.tag, label.text = "p", name + " "
+            label.append(value[0])
+            value.drop_tree()
 
 
 def _readable_markdown(html: str, base_url: str) -> str | None:
@@ -384,6 +451,7 @@ def _readable_markdown(html: str, base_url: str) -> str | None:
     if tree is None:
         return None
     _absolutize(tree, base_url)
+    _join_labelled_links(tree)
     md = trafilatura.extract(
         tree,
         url=base_url,
