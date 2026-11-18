@@ -238,8 +238,9 @@ def test_recursive_list_model_follows_nested_page_data_with_item_provenance():
     html = _ld({"@type": "Thing", "name": "root",
                 "children": [{"name": "a", "children": [{"name": "a1"}]}, {"name": "b"}]})
     out = _fill(html, _schema(Node))
+    # A node without children gets the model's default ([]), and is still listed as missing.
     assert out["data"] == {"name": "root", "children": [
-        {"name": "a", "children": [{"name": "a1", "children": None}]}, {"name": "b", "children": None}]}
+        {"name": "a", "children": [{"name": "a1", "children": []}]}, {"name": "b", "children": []}]}
     assert out["sources"]["children"] == "json-ld:Thing.children"
     assert out["sources"]["children[0].children[0].name"] == "json-ld:Thing.children.children.name"
     assert {"children[0].children[0].children", "children[1].children"} <= set(out["missing"])
