@@ -310,7 +310,12 @@ def presets_for(host: str) -> list[tuple[Recipe, str, dict[str, str]]]:
 
 def check_response(*, original_url: str, url: str, status: int, location: str | None, head: str) -> GateAction | None:
     for r in RECIPES:
-        action = r.on_response(original_url=original_url, url=url, status=status, location=location, head=head)
+        # The Location and the URLs inside its query are the destination's: one that does
+        # not parse ("http://[object Object]/") is not this recipe's gate.
+        try:
+            action = r.on_response(original_url=original_url, url=url, status=status, location=location, head=head)
+        except ValueError:
+            continue
         if action is not None:
             return action
     return None

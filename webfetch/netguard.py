@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import socket
 from dataclasses import dataclass
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
 
 MAX_URL_LENGTH = 8192
+_HOST_NAME = re.compile(r"[a-z0-9._-]+")  # after IDNA encoding
 BLOCKED_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".intranet")
 BLOCKED_HOSTS = {"localhost", "metadata", "metadata.google.internal", "instance-data"}
 # Caller headers that may reach any origin: they describe the client, not who it is.
@@ -45,6 +47,16 @@ class Target:
     port: int
 
 
+def split_url(url: str) -> SplitResult:
+    """``urlsplit``, with its refusals as InvalidUrl: it raises a bare ValueError for a
+    bracketed host that is not an IP literal ("http://[object Object]/", "http://[::1") and
+    for host characters that normalize to a delimiter."""
+    try:
+        return urlsplit(url)
+    except ValueError as exc:
+        raise InvalidUrl(f"url does not parse: {exc}") from None
+
+
 def normalize_url(raw: str) -> Target:
     """Validate a user-supplied URL and return it in canonical form.
 
@@ -61,7 +73,7 @@ def normalize_url(raw: str) -> Target:
         raise InvalidUrl("url contains whitespace or control characters")
     if "://" not in url:
         url = "https://" + url
-    parts = urlsplit(url)
+    parts = split_url(url)
     scheme = parts.scheme.lower()
     if scheme not in ("http", "https"):
         raise InvalidUrl("only http and https URLs can be fetched")
@@ -76,11 +88,18 @@ def normalize_url(raw: str) -> Target:
         is_ip = True
     except ValueError:
         is_ip = False
+    if is_ip and "%" in host:
+        raise InvalidUrl("IPv6 zone identifiers are not supported")
     if not is_ip:
         try:
             host = host.encode("idna").decode("ascii")
         except UnicodeError as exc:
             raise InvalidUrl(f"invalid host name: {exc}") from exc
+        # libcurl refuses most other characters outright and percent-decodes the host
+        # ("%61.example" is "a.example" to it): it would then look up, by itself, a name
+        # other than the one resolved and checked here.
+        if not _HOST_NAME.fullmatch(host):
+            raise InvalidUrl("invalid host name: only letters, digits, '-', '_' and '.' are allowed")
     try:
         port = parts.port or (443 if scheme == "https" else 80)
     except ValueError as exc:

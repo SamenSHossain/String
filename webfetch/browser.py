@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from urllib.parse import urlsplit
 
 from .egress import EgressProxy
@@ -26,21 +27,28 @@ BLOCKED_RESOURCES = {"image", "media", "font"}
 MAX_REPORTED_REDIRECTS = 30  # Chromium itself gives up after 20
 
 
-async def _redirect_chain(resp) -> list[dict]:
-    """The redirects Chromium followed to reach ``resp``, first hop first."""
+def _origin(url: str) -> tuple[str, str] | None:
+    """(scheme, netloc), or None for a URL Chromium requests that ``urlsplit`` refuses."""
+    try:
+        return urlsplit(url)[:2]
+    except ValueError:
+        return None
+
+
+def _hops(responses) -> list[dict]:
+    """One hop per main-frame navigation response before the last, oldest first: the
+    redirects Chromium followed and the documents that navigated on (a challenge that
+    reloads the page, a meta refresh, a script redirect)."""
     hops: list[dict] = []
     try:
-        req = resp.request.redirected_from if resp is not None else None
-        while req is not None and len(hops) < MAX_REPORTED_REDIRECTS:
-            r = await req.response()
-            end = (req.timing or {}).get("responseEnd", -1)  # ms after the request started
-            hops.append({"url": req.url, "status": r.status if r is not None else 0,
-                         "location": r.headers.get("location") if r is not None else None,
+        for r in list(responses)[:-1][-MAX_REPORTED_REDIRECTS:]:
+            end = (r.request.timing or {}).get("responseEnd", -1)  # ms after the request started
+            hops.append({"url": r.url, "status": r.status,
+                         "location": r.headers.get("location") if 300 <= r.status < 400 else None,
                          "ms": round(end, 1) if end and end > 0 else 0.0})
-            req = req.redirected_from
     except Exception:  # reporting hops must never cost the page
         pass
-    return hops[::-1]
+    return hops
 
 
 class BrowserPool:
@@ -102,7 +110,7 @@ class BrowserPool:
         ctx = await self._browser.new_context(
             locale="en-US", timezone_id="America/New_York", viewport={"width": 1366, "height": 900},
         )
-        origin = urlsplit(url)[:2]
+        origin = _origin(url)
         try:
             if cookies:
                 await ctx.add_cookies([{"name": c["name"], "value": c["value"], "domain": c["domain"],
@@ -114,12 +122,15 @@ class BrowserPool:
                 if req.resource_type in BLOCKED_RESOURCES:
                     return await route.abort()
                 # The caller's (cross-origin-safe) headers go on requests to the named origin.
-                if headers and urlsplit(req.url)[:2] == origin:
+                if headers and origin is not None and _origin(req.url) == origin:
                     return await route.continue_(headers={**req.headers, **headers})
                 await route.continue_()
 
             await page.route("**/*", guard)
-            nav = {"t": time.monotonic(), "resp": None}
+            nav = {"t": time.monotonic()}
+            # Every main-frame navigation response, in order (the newest ones if the page
+            # never stops navigating): the last is the page, the others are its hops.
+            responses: deque = deque(maxlen=MAX_REPORTED_REDIRECTS + 1)
 
             def on_nav(frame):
                 if frame == page.main_frame:
@@ -128,7 +139,7 @@ class BrowserPool:
             def on_resp(r):
                 try:
                     if r.request.is_navigation_request() and r.frame == page.main_frame:
-                        nav["resp"] = r
+                        responses.append(r)
                 except Exception:
                     pass
 
@@ -151,10 +162,10 @@ class BrowserPool:
                     challenged = True
                 if not challenged and time.monotonic() - nav["t"] >= QUIET_SECONDS:
                     break
-                if not challenged and nav["resp"] is not None and nav["resp"].status < 400:
+                if not challenged and responses and responses[-1].status < 400:
                     break
                 await page.wait_for_timeout(500)
-            resp = nav["resp"] or resp
+            resp = responses[-1] if responses else resp
             html = await page.content()
             if len(html) > max_bytes:
                 return {"error": "too_large", "message": f"rendered page is larger than {max_bytes} bytes",
@@ -166,7 +177,7 @@ class BrowserPool:
                 "status": status,
                 "headers": hdrs,
                 "html": html,
-                "redirects": await _redirect_chain(resp),
+                "redirects": _hops(responses),
                 "ms": round((time.monotonic() - t0) * 1000, 1),
                 "strategy": f"browser:{self.engine}",
             }

@@ -93,6 +93,16 @@ class Handler(BaseHTTPRequestHandler):
                                  "ua": self.headers.get("User-Agent", "")})
 
         # Routes that answer on every host (tests point any name at this server).
+        if path == "/r2s/refresh":  # a page whose <meta refresh> points wherever ?url= says (sent as is)
+            return self._send(200, '<html><head><title>Moving</title><meta http-equiv="refresh" content="0;url='
+                                   + qs["url"][0] + '"></head><body><p>' + "This page has moved. " * 30
+                              + "</p></body></html>")
+        if path == "/r2s/big":
+            return self._send(200, "<html><body><p>" + "x" * 200_000 + "</p></body></html>")
+        if path == "/r2s/js-redirect":  # a page whose script navigates wherever ?url= says
+            import json as _json
+            return self._send(200, "<html><head><title>Redirecting</title></head><body><script>location.replace("
+                                   + _json.dumps(qs["url"][0]) + ")</script></body></html>")
         if path == "/echo-headers":
             import html as _html
             import json as _json

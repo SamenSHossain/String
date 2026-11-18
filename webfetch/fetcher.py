@@ -11,10 +11,9 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
-from curl_cffi import AsyncCurl, CurlInfo, CurlOpt
+from curl_cffi import AsyncCurl, CurlError, CurlInfo, CurlOpt
 from curl_cffi.curl import CURL_WRITEFUNC_ERROR
 from curl_cffi.requests import AsyncSession
-from curl_cffi.requests.exceptions import RequestException
 
 from .config import Settings
 from .gates import GateEvent, check_response, presets_for
@@ -60,12 +59,14 @@ MAX_META_REFRESH = 2
 
 
 class FetchError(Exception):
-    def __init__(self, code: str, message: str, *, hops: list | None = None, gates: list | None = None):
+    def __init__(self, code: str, message: str, *, hops: list | None = None, gates: list | None = None,
+                 url: str | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
-        self.hops = hops or []
+        self.hops = hops or []  # the hops that answered before the failure
         self.gates = gates or []
+        self.url = url  # the URL whose request (or page) failed, when the failure has one
 
 
 @dataclass
@@ -99,7 +100,7 @@ class FetchResult:
     extra: dict = field(default_factory=dict)
 
 
-def _curl_error_code(exc: RequestException) -> str:
+def _curl_error_code(exc: CurlError) -> str:
     code = int(getattr(exc, "code", 0) or 0)
     if code == 28:
         return "timeout"
@@ -186,6 +187,16 @@ class HttpFetcher:
             redirects = gate_actions = meta_refreshes = 0
             resolve_ms = 0.0
             then_url: str | None = None
+
+            def resolve(ref: str) -> str:
+                # urljoin raises on a reference it cannot parse ("http://[object Object]/",
+                # "//[x"): that is a redirect to something that is not a URL.
+                try:
+                    return urljoin(current, ref)
+                except ValueError:
+                    raise FetchError("invalid_redirect", f"redirected to an invalid URL: {ref[:200]!r}",
+                                     hops=hops, gates=gates) from None
+
             while True:
                 try:
                     hop_target = normalize_url(current)
@@ -198,14 +209,14 @@ class HttpFetcher:
                     try:
                         ips = await resolve_public(hop_target.host, hop_target.port, allow_private=s.allow_private)
                     except InvalidUrl as exc:
-                        raise FetchError("dns_error", str(exc), hops=hops, gates=gates) from exc
+                        raise FetchError("dns_error", str(exc), hops=hops, gates=gates, url=current) from exc
                     resolve_ms += (time.monotonic() - t_dns) * 1000
                     pinned = ",".join(f"[{ip}]" if ":" in ip else ip for ip in ips[:4])
                     curl_options[CurlOpt.RESOLVE] = [f"{hop_target.host}:{hop_target.port}:{pinned}"]
                     curl_options[CurlOpt.NOPROXY] = "*"
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.2:
-                    raise FetchError("timeout", f"no response within {timeout:.0f}s", hops=hops, gates=gates)
+                    raise FetchError("timeout", f"no response within {timeout:.0f}s", hops=hops, gates=gates, url=current)
                 hop_start = time.monotonic()
                 kwargs = {}
                 if http_version:
@@ -242,10 +253,14 @@ class HttpFetcher:
                         content_callback=sink,
                         **kwargs,
                     )
-                except RequestException as exc:
+                # CurlError, not only its RequestException subclass: a URL libcurl itself
+                # refuses surfaces as the bare class.
+                except CurlError as exc:
                     if overflow:
-                        raise FetchError("too_large", f"response is larger than {max_bytes} bytes", hops=hops, gates=gates) from exc
-                    raise FetchError(_curl_error_code(exc), str(exc).split(". See ")[0][:300], hops=hops, gates=gates) from exc
+                        raise FetchError("too_large", f"response is larger than {max_bytes} bytes", hops=hops, gates=gates,
+                                         url=current) from exc
+                    raise FetchError(_curl_error_code(exc), str(exc).split(". See ")[0][:300], hops=hops, gates=gates,
+                                     url=current) from exc
                 body = bytes(buf)
                 hop_ms = (time.monotonic() - hop_start) * 1000
                 remote_ip = resp.primary_ip or ""
@@ -277,7 +292,7 @@ class HttpFetcher:
                     redirects += 1
                     if redirects > s.max_redirects:
                         raise FetchError("too_many_redirects", f"more than {s.max_redirects} redirects", hops=hops, gates=gates)
-                    current = urljoin(current, location.strip())
+                    current = resolve(location.strip())
                     continue
 
                 if status == 200 and len(body) < 16384 and meta_refreshes < MAX_META_REFRESH:
@@ -286,7 +301,7 @@ class HttpFetcher:
                     refresh = _meta_refresh(body)
                     if refresh and refresh[0] <= 5:
                         meta_refreshes += 1
-                        current = urljoin(current, _html.unescape(refresh[1]))
+                        current = resolve(_html.unescape(refresh[1]))
                         continue
                 break
 

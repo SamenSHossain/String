@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlsplit
@@ -98,6 +100,11 @@ def _validate(expect: Expect | None, page: Page) -> dict | None:
 MAX_PARSE_CHARS = 6_000_000
 MAX_NESTING = 1500
 MAX_CONCURRENT_ANALYSIS = 4
+# Analysis and output rendering get what is left of the request's timeout, and at least
+# this many seconds per request: an ordinary page needs a fraction of one, so it is not
+# failed because a slow origin used up the timeout. It is also the most an answer can
+# overrun the timeout by.
+MIN_PROCESSING_SECONDS = 2.0
 _TAG = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]{0,15})(?=[\s/>])")
 # Only HTML container/formatting elements count toward depth: SVG children (<path/>,
 # <use/>) self-close, and p/li/td-style elements are routinely left unclosed.
@@ -107,11 +114,18 @@ _COUNTED = {"div", "span", "section", "article", "aside", "nav", "header", "foot
             "code", "pre", "q", "cite", "abbr", "sub", "sup", "mark", "del", "ins", "h1", "h2", "h3", "h4", "h5",
             "h6", "picture", "object", "nobr", "tt", "strike", "dfn", "kbd", "samp", "var", "bdo", "bdi", "time",
             "address", "hgroup", "search", "menu", "map", "canvas", "video", "audio", "legend", "output"}
-_analysis_slots: dict[int, asyncio.Semaphore] = {}
+# The pool is the hard bound on analysis threads; the per-loop semaphore admits work only
+# when a thread is free, so a waiting request queues nothing (and holds no page) in the pool.
+_analysis_pool = ThreadPoolExecutor(MAX_CONCURRENT_ANALYSIS, thread_name_prefix="webfetch-analysis")
+_analysis_slots: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 
 
 class TooComplex(Exception):
     pass
+
+
+class ProcessingTimeout(Exception):
+    """Page work did not get a free thread and finish within the time it was given."""
 
 
 def _check_nesting(text: str) -> None:
@@ -151,12 +165,46 @@ def _strip_raw_text(text: str) -> str:
         pos = end + len(closer)
 
 
-async def _bounded(fn, *args):
-    """Run CPU-heavy page work in a thread, at most a few at a time per process."""
+def _slots(loop: asyncio.AbstractEventLoop) -> asyncio.Semaphore:
+    sem = _analysis_slots.get(loop)
+    if sem is None:
+        for closed in [other for other in _analysis_slots if other.is_closed()]:
+            del _analysis_slots[closed]
+        sem = _analysis_slots[loop] = asyncio.Semaphore(MAX_CONCURRENT_ANALYSIS)
+    return sem
+
+
+def _release(loop: asyncio.AbstractEventLoop, sem: asyncio.Semaphore) -> None:
+    try:
+        loop.call_soon_threadsafe(sem.release)
+    except RuntimeError:  # the loop is closed: nobody waits for its slots any more
+        pass
+
+
+async def _bounded(fn, *args, timeout: float | None = None):
+    """Run CPU-heavy page work in a thread, at most MAX_CONCURRENT_ANALYSIS at a time per
+    process. ``timeout`` covers the wait for a free thread and the work together; when it
+    runs out, ProcessingTimeout is raised.
+
+    A running thread cannot be stopped, so its slot is released when the work really ends
+    (from the worker's future), not when this coroutine does: a timeout or a cancelled
+    request ends the coroutine while the thread runs on, and a slot freed that early would
+    let more than the bound run at once."""
+    if timeout is not None and timeout <= 0:
+        raise ProcessingTimeout
     loop = asyncio.get_running_loop()
-    sem = _analysis_slots.setdefault(id(loop), asyncio.Semaphore(MAX_CONCURRENT_ANALYSIS))
-    async with sem:
-        return await asyncio.to_thread(fn, *args)
+    sem = _slots(loop)
+    limit = asyncio.timeout(timeout)
+    try:
+        async with limit:
+            await sem.acquire()
+            work = _analysis_pool.submit(contextvars.copy_context().run, fn, *args)
+            work.add_done_callback(lambda _done: _release(loop, sem))
+            return await asyncio.wrap_future(work)
+    except TimeoutError:
+        if not limit.expired():  # the work's own TimeoutError
+            raise
+        raise ProcessingTimeout from None
 
 
 def _analyze(result: FetchResult, expect: Expect | None) -> Page:
@@ -257,6 +305,12 @@ def _browser_result(url: str, data: dict[str, Any], gates: list[GateEvent]) -> F
 MIN_ESCALATION_SECONDS = 2.0
 
 
+def _page_error(code: str, message: str, res: FetchResult) -> FetchError:
+    """A failure met after the page was fetched: it names that page, and the hops before
+    it are its redirects (as in the envelope of a page that was served)."""
+    return FetchError(code, message, hops=res.hops[:-1], gates=res.gates, url=res.final_url)
+
+
 def _wall_in_redirect_loop(err: FetchError) -> tuple[str, str] | None:
     """(outcome, reason) when the redirects that ran out pass through an age check or a
     consent page: the destination sends every visitor there and back without serving the
@@ -285,6 +339,21 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
     best: Page | None = None
     last_error: FetchError | None = None
     last_error_strategy = ""
+    processing = 0.0  # seconds of page work so far, waits for a free thread included
+
+    async def process(res: FetchResult, fn, *args):
+        """Page work on what ``res`` fetched, within what the request has left for it."""
+        nonlocal processing
+        p0 = time.monotonic()
+        try:
+            return await _bounded(fn, *args, timeout=max(left(), MIN_PROCESSING_SECONDS - processing))
+        except TooComplex as exc:
+            raise _page_error("too_complex", str(exc), res) from None
+        except ProcessingTimeout:
+            raise _page_error("timeout", f"the page was fetched, but processing it did not finish within the "
+                                         f"request's {budget:g}s timeout", res) from None
+        finally:
+            processing += time.monotonic() - p0
 
     async def http_attempt(impersonate: str | None) -> Page | None:
         nonlocal last_error, last_error_strategy
@@ -295,16 +364,10 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
                 opts.url, headers=opts.headers, cookies=opts.cookies, timeout=max(left(), 0.5),
                 resolve_gates=opts.resolve_gates, max_bytes=opts.max_bytes, impersonate=impersonate,
             )
+            page = await process(res, _analyze, res, opts.expect)
         except FetchError as exc:
             last_error, last_error_strategy = exc, strategy
             attempts.append({"strategy": strategy, "error": exc.code, "message": exc.message,
-                             "ms": round((time.monotonic() - a0) * 1000, 1)})
-            return None
-        try:
-            page = await _bounded(_analyze, res, opts.expect)
-        except TooComplex as exc:
-            last_error, last_error_strategy = FetchError("too_complex", str(exc)), res.strategy
-            attempts.append({"strategy": res.strategy, "error": "too_complex", "message": str(exc),
                              "ms": round((time.monotonic() - a0) * 1000, 1)})
             return None
         attempts.append({"strategy": res.strategy, "outcome": page.verdict.outcome, "statusCode": res.status,
@@ -313,6 +376,7 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
         return page
 
     async def browser_attempt() -> Page | None:
+        nonlocal last_error, last_error_strategy
         if browser is None:
             return None
         a0 = time.monotonic()
@@ -353,9 +417,10 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
                      for r, _d, _c in presets_for(normalize_url(opts.url).host)]
         res = _browser_result(opts.url, data, gates)
         try:
-            page = await _bounded(_analyze, res, opts.expect)
-        except TooComplex as exc:
-            attempts.append({"strategy": res.strategy, "error": "too_complex", "message": str(exc),
+            page = await process(res, _analyze, res, opts.expect)
+        except FetchError as exc:
+            last_error, last_error_strategy = exc, res.strategy
+            attempts.append({"strategy": res.strategy, "error": exc.code, "message": exc.message,
                              "ms": round((time.monotonic() - a0) * 1000, 1), **note})
             return None
         attempts.append({"strategy": res.strategy, "outcome": page.verdict.outcome, "statusCode": res.status,
@@ -384,7 +449,20 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
                                              (not best.verdict.ok and rendered.verdict.ok)):
                     best = rendered
 
-    total_ms = round((time.monotonic() - t0) * 1000, 1)
+    def fetch_error(err: FetchError, strategy: str | None) -> dict[str, Any]:
+        return {
+            "ok": False, "outcome": "fetch_error", "error": err.code, "reason": err.message,
+            # No destination answer, so no statusCode. One attempt is described: its strategy,
+            # the hops that answered, and the URL whose request or page failed (the last hop
+            # itself when it redirected to nowhere usable).
+            "url": opts.url, "finalUrl": err.url or (err.hops[-1].url if err.hops else normalize_url(opts.url).url),
+            "strategy": strategy,
+            "attempts": attempts,
+            "gates": [g.as_dict() for g in err.gates],
+            "redirects": [h.as_dict() for h in err.hops],
+            "timing": {"totalMs": round((time.monotonic() - t0) * 1000, 1)},
+        }
+
     if best is None:
         err = last_error or FetchError("fetch_error", "the page could not be fetched")
         wall = _wall_in_redirect_loop(err)
@@ -395,21 +473,17 @@ async def run_fetch(opts: FetchOptions, fetcher: HttpFetcher, browser: BrowserCl
                 "url": normalize_url(opts.url).url, "finalUrl": last.url, "statusCode": last.status,
                 "strategy": last_error_strategy, "gates": [g.as_dict() for g in err.gates],
                 "redirects": [h.as_dict() for h in err.hops], "attempts": attempts,
-                "timing": {"totalMs": total_ms},
+                "timing": {"totalMs": round((time.monotonic() - t0) * 1000, 1)},
             }
-        return {
-            "ok": False, "outcome": "fetch_error", "error": err.code, "reason": err.message,
-            # No destination answer, so no statusCode; how far it got, and with what:
-            "url": opts.url, "finalUrl": err.hops[-1].url if err.hops else normalize_url(opts.url).url,
-            "strategy": attempts[-1]["strategy"] if attempts else None,
-            "attempts": attempts,
-            "gates": [g.as_dict() for g in err.gates],
-            "redirects": [h.as_dict() for h in err.hops],
-            "timing": {"totalMs": total_ms},
-        }
+        # Without an error of its own to report, the request was one browser attempt that
+        # the browser tier could not make.
+        return fetch_error(err, last_error_strategy if last_error else attempts[-1]["strategy"])
 
     p0 = time.monotonic()
-    envelope = await _bounded(_render_outputs, best, opts)
+    try:
+        envelope = await process(best.result, _render_outputs, best, opts)
+    except FetchError as exc:
+        return fetch_error(exc, best.result.strategy)
     process_ms = round((time.monotonic() - p0) * 1000, 1)
     r = best.result
     envelope.update({

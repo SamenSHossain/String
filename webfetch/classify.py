@@ -156,7 +156,10 @@ def classify(
             return Verdict("rate_limited", "destination served a rate-limit notice (503)")
         return Verdict("server_error", "destination answered 503")
 
-    parts = urlsplit(final_url)
+    try:
+        parts = urlsplit(final_url)
+    except ValueError:  # the browser tier reports where Chromium ended up, as Chromium spells it
+        parts = urlsplit("")
     host = (parts.hostname or "").lower()
     orig = urlsplit(original_url)
     orig_host = (orig.hostname or "").lower()
