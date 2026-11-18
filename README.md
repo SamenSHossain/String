@@ -135,7 +135,7 @@ with String called back to back from the same client. Raw data: [`bench/`](bench
 the same day, before the fixes from an independent review, is in
 [`bench/archive/2026-11-16-first-run/`](bench/archive/2026-11-16-first-run). Re-checked on
 2026-11-18 against the current deployment: the four pairs in the Submission block, the
-Steam accuracy run (§4.2) and the 48 live checks of `bench/verify_live.py`.
+Steam accuracy run (§4.2) and the 50 live checks of `bench/verify_live.py`.
 
 ### 4.1 The targets: String 0/10, webfetch 9/10
 
@@ -251,9 +251,9 @@ report `fetch, process, total`.
    page has no value for takes its schema `default` (so a Pydantic model with defaults
    validates; the property is still listed in `missing`), and identifiers (SKU, MPN, GTIN,
    EAN, UPC, ISBN) are read only from their own keys, never from another key or another
-   entity on the page. One fill is bounded (10,000 members, 1,000,000 characters of
-   result, a fixed amount of work on the page's data): past a bound the rest is `null`
-   and `extracted.truncated` is `true`.
+   entity on the page. A default JSON cannot carry (`NaN`, an infinity) is not used. One
+   fill is bounded (10,000 members, 1,000,000 bytes of result, a fixed amount of work on
+   the page's data): past a bound the rest is `null` and `extracted.truncated` is `true`.
 5. **Escalation only when needed.** Plain HTTP with Chrome's TLS/HTTP2 fingerprint first;
    Safari's fingerprint on a challenge, block or rate limit; headless Chromium when the HTTP
    tier fails to fetch, or returns a challenge, block, rate limit, empty page or JavaScript
@@ -274,8 +274,11 @@ report `fetch, process, total`.
    and invalid bytes follow WHATWG's error rules. A declared charset is kept when only a
    few bytes are invalid (shown as U+FFFD, as in browsers; `encodingSource` ends in
    `-lossy`); when errors are pervasive, the declaration is taken to be wrong and a
-   detector decides; it also decides when a legacy multi-byte declaration with few errors
-   reads as mojibake next to its guess (those encodings decode each other's bytes). A
+   detector decides. The legacy multi-byte encodings decode each other's bytes with few
+   errors, so for them few errors do not show that a declaration is right: a declared
+   EUC-JP, Shift_JIS, EUC-KR, Big5 or GBK is given up for another of them (the detector's
+   guess, or the other of header and `<meta>`) when that one reads clearly better on the
+   text before each text node's first error. A
    browser-tier body is Chromium's DOM, so it is UTF-8 whatever the origin declared.
    `format: raw` returns the original bytes with the origin's
    `Content-Type`; when that names no charset, webfetch adds the one it decoded with, under
@@ -317,7 +320,14 @@ verifiers went through the fixes for those and confirmed 23 further problems (a
 self-referencing `jsonSchema` of about 130 bytes could exhaust the container's memory;
 hostile pages could cost seconds of CPU; a malformed redirect was a `500`). All of them are
 fixed, and each has a regression test and, where a public page shows it, a live check in
-[`bench/verify_live.py`](bench/verify_live.py).
+[`bench/verify_live.py`](bench/verify_live.py). Two more verifiers then attacked the merged
+fixes and found 15 further problems. Five had come in with those fixes (a result budget
+that counted characters instead of bytes, a `NaN` default that became a `500`, arrays cut
+to 200 referenced items, correctly declared legacy pages decoded as another encoding when
+they held stray bytes, a content-type test that a parameter could fool); the others were
+older (a page of tens of thousands of `<script>` elements cost seconds of CPU; a
+non-ASCII meta-refresh target went to the wrong URL). Ten are repaired; the five that
+remain are small and are stated in §6 and §8.
 
 ## 6. API
 
@@ -342,9 +352,12 @@ String's other request fields, so that a request written for String can be sent 
 |---|---|
 | `method`, `body` | `method` is accepted in any letter case; only `GET` without a `body` is supported, anything else is a `400` that says so |
 | `actions`, `screenshot`, `captureXHR` | accepted when absent, `null`, `false` or `[]`; a value that asks for the feature is a `400` naming the field (the response would not contain what was asked for) |
-| `countryCode`, `solveCaptcha`, `ignoreCertificateErrors`, `requireWSS` | accepted, without effect: one egress region, captchas are never solved (a challenge is reported as `challenge`), certificates are always verified, there is no WebSocket path. When one asks for behaviour webfetch does not have (`countryCode` set, or one of the others `true`), the response names it in `ignoredParameters` and in the `x-ignored-parameters` header |
+| `countryCode`, `solveCaptcha`, `ignoreCertificateErrors`, `requireWSS` | accepted, without effect: one egress region, captchas are never solved (a challenge is reported as `challenge`), certificates are always verified, there is no WebSocket path. When one asks for behaviour webfetch does not have (`countryCode` set, or one of the others `true`), every answer to the accepted request names it in `ignoredParameters` and in the `x-ignored-parameters` header (a `401`, `429` or `400` validation error is sent before the fields are read) |
 
-A field neither service has is a `400`. The JSON envelope and a `jsonSchema` response are
+A field neither service has is a `400`. `GET /v1/fetch` reads `url`, `format`,
+`markdownMode`, `render`, `resolveGates` and `include` from the query string; any other
+request field there (`executeJS`, `timeout`, `jsonSchema`, ...) is a `400` that names it
+and says to POST, and parameters that are no field are ignored. The JSON envelope and a `jsonSchema` response are
 webfetch's own (String answers a `jsonSchema` request with the extracted object alone;
 here it is `extracted.data`, next to `sources` and `missing`).
 
@@ -369,12 +382,12 @@ binary content requested as markdown/text/html (`ok: false`); `429` rate limited
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q                                   # 759 tests; a local server emulates the Steam,
+pytest -q                                   # 831 tests; a local server emulates the Steam,
                                             # DPG, ZEIT and Golem gate flows
 python -m webfetch.cli https://www.nu.nl/   # one fetch, JSON line out
 uvicorn --factory webfetch.api:create_app   # local API on :8000
 modal deploy modal_app.py && modal deploy modal_browser.py
-python3 bench/verify_live.py                # 48 pass/fail checks against the live endpoint
+python3 bench/verify_live.py                # 50 pass/fail checks against the live endpoint
 python3 bench/pair.py                       # the same request through String and through webfetch
 ```
 
@@ -419,9 +432,24 @@ Environment: `WEBFETCH_API_KEYS` (comma-separated; when set, every request needs
   that holds a single link (`Developer:` and the studio's link on a Steam page) is kept as
   one line; a value made of several links is still dropped.
 - **Bounds can cut extremes short.** A schema fill stops at 10,000 members, 1,000,000
-  characters of result or its work budget (`extracted.truncated`); of a list of more than
-  200 JSON-LD `@id` references the first 200 are followed; `links` omits `javascript:`,
-  `vbscript:`, `data:`, `mailto:`, `tel:` and same-page targets.
+  bytes of result or its work budget, and says so (`extracted.truncated`). Collecting a
+  page's structured data has caps that are not reported: 50,000 candidate values, 500,000
+  values visited, the first 20 `@type`s of a node, keys of at most 100 characters, 200
+  OpenGraph and 200 Twitter tags; a text or object property reads the first 200 entries
+  of a list of `@id` references (an array reads all of them), and a node named twice in
+  one list is one item. Only hostile or extreme pages reach these. `links` omits
+  `javascript:`, `vbscript:`, `data:`, `mailto:`, `tel:` and same-page targets.
+- **A correctly declared legacy page can still lose its declaration.** The rule that
+  rescues wrongly declared CJK pages (§5.8) misjudges some correctly declared ones that
+  also hold stray bytes: 0.5% of a synthetic corpus of 48,000 such pages, all of them
+  either one long text node that starts with the stray bytes or text a mojibake measure
+  misreads (half-width katakana, kana tables, rows of symbols). Pages without stray bytes
+  are never affected.
+- **The browser tier reads an undeclared UTF-8 page as Chromium does.** A page with no
+  charset in its header or a `<meta>` is windows-1252 to Chromium, so `render: always`
+  returns mojibake for it where the HTTP tier (the default) decodes it as UTF-8.
+- **A quoted meta-refresh target is cut at its first space** (`url='/a b'` is followed as
+  `/a`); a space in a redirect `Location` is followed as `%20`.
 - **Extraction reads only what the page carries.** Fields that exist only as free text
   (not in JSON-LD, microdata, meta tags or a site extractor) come back `null`. An LLM
   fallback for those fields, with each value checked against the page text, is the

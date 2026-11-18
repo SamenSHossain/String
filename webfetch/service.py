@@ -151,14 +151,21 @@ def _strip_raw_text(text: str) -> str:
     """Drop <script>/<style> contents (where '<d' or '<i' are code, not tags), linearly."""
     low = text.lower()
     out, pos = [], 0
+    # Where each opener next occurs. One is looked for again only when the scan has passed
+    # it: searching for both from every position rescans the rest of the text once per
+    # element whenever one of them is rare, which is quadratic on a page of many scripts.
+    nxt = {"<script": low.find("<script"), "<style": low.find("<style")}
     while True:
-        starts = [i for i in (low.find("<script", pos), low.find("<style", pos)) if i >= 0]
+        for opener, at in nxt.items():
+            if 0 <= at < pos:
+                nxt[opener] = low.find(opener, pos)
+        starts = [(at, opener) for opener, at in nxt.items() if at >= 0]
         if not starts:
             out.append(text[pos:])
             return "".join(out)
-        start = min(starts)
-        closer = "</script" if low.startswith("<script", start) else "</style"
+        start, opener = min(starts)
         out.append(text[pos:start])
+        closer = "</script" if opener == "<script" else "</style"
         end = low.find(closer, start)
         if end < 0:
             return "".join(out)

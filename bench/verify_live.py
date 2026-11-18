@@ -261,6 +261,20 @@ def review_fixes() -> None:
           status == 200 and d == {"name": "Example Domain", "children": [], "note": None, "kind": "page"}
           and {"children", "note", "kind"} <= set(ex.get("missing") or []), f"{status} {d}")
 
+    # Pydantic emits these for `score: float = float("nan")` and `limit: float = math.inf`.
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": example, "include": [], "jsonSchema": {
+        "type": "object", "properties": {"title": {"type": "string"},
+                                         "score": {"type": "number", "default": float("nan")},
+                                         "limit": {"type": "number", "default": float("inf")}}}})
+    d = (parse_json(body).get("extracted") or {}).get("data") or {}
+    check("a schema default JSON cannot carry (NaN, Infinity) leaves the property null instead of a 500",
+          status == 200 and d == {"title": "Example Domain", "score": None, "limit": None}, f"{status} {d}")
+
+    status, h, body, _s = request("GET", "/v1/fetch?url=" + urllib.request.quote(example, safe="") + "&executeJS=true")
+    env = parse_json(body)
+    check("GET /v1/fetch refuses a request field it does not read instead of ignoring it",
+          status == 400 and "executeJS" in json.dumps(env), f"{status} {(env.get('message') or '')[:90]}")
+
     bad = "http://[object Object]/"
     status, h, body, _s = request("POST", "/v1/fetch", {
         "url": "https://postman-echo.com/redirect-to?url=" + urllib.request.quote(bad, safe=""), "render": "never"})

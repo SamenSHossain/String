@@ -373,25 +373,44 @@ def _few_errors(text: str, errors: int) -> bool:
 # declaration is right; how the text reads does.
 _CROSS_DECODING = {"euc_jp", "big5hkscs", "cp932", "cp949", "gb18030"}
 _HIGH_BYTE = re.compile(rb"[\x80-\xff]")
-_TEXT_RUN = re.compile(r"[^\x00-\x7f][^<>]{0,300}")  # non-ASCII text, to the end of its text node
+_TEXT_NODE = re.compile(rb"[^<>]*[\x80-\xff][^<>]*")  # "<" and ">" are no trail bytes in these encodings
+_MAX_NODES = 2_000
+
+
+def _clean_prefix(node: bytes, enc: str) -> bytes:
+    try:
+        node.decode(enc)
+    except UnicodeDecodeError as err:
+        return node[:err.start]
+    return node
 
 
 def _reads_better(data: bytes, guess: str | None, enc: str) -> bool:
     """Whether the detector's guess makes clearly better text of the body than `enc`, a declared
-    charset that decoded it with few errors. Judged by charset-normalizer's measure of mojibake
-    (0 for clean text, 0.2 where the detector itself gives a decoding up), on the same stretch of
-    the body, so that stray bytes in a correctly declared page cost both readings alike."""
-    if guess is None or guess == enc:
+    charset that decoded it with few errors. Only another of these encodings can: a single-byte
+    guess says nothing against a declaration that decoded nearly everything.
+
+    A stray byte in a correctly declared page garbles what follows it in its text node, and
+    nothing before it; a wrong declaration reads wrongly everywhere. So the two readings are
+    compared on what the declared charset decodes of each text node before its first error, or
+    on the whole nodes where that is little of their text (errors from the start on are no stray
+    byte), by charset-normalizer's measure of mojibake: 0 for clean text, 0.2 where the detector
+    itself gives a decoding up."""
+    if guess not in _CROSS_DECODING or guess == enc:
         return False
     start = _HIGH_BYTE.search(data)
-    start = start.start() if start else 0
-    mess = []
-    for codec in (enc, guess):
-        decoded = _decode(data[start:start + 100_000], codec, steps=1_000)  # a sample: it need not be exact
-        runs = "\n".join(_TEXT_RUN.findall(decoded[0])).replace(_FFFD, "")[:16_000] if decoded else ""
-        if len(runs) - len(runs.encode("ascii", "ignore")) < 16:  # too little text to judge by
-            return False
-        mess.append(mess_ratio(runs))
+    nodes = _TEXT_NODE.findall(data[start.start():start.start() + 100_000] if start else b"")[:_MAX_NODES]
+    sample = b"\n".join(nodes)  # it need not be exact
+    before_errors = b"\n".join(_clean_prefix(node, enc) for node in nodes)
+    declared, clean = _decode(sample, enc, steps=1_000), _decode(before_errors, enc, steps=1_000)
+    if declared is None or clean is None:
+        return False
+    if 4 * _decoded_chars(*clean) >= _decoded_chars(*declared):
+        sample, declared = before_errors, clean
+    guessed = _decode(sample, guess, steps=1_000)
+    if guessed is None or min(_decoded_chars(*declared), _decoded_chars(*guessed)) < 16:  # too little text to judge by
+        return False
+    mess = [mess_ratio(text.replace(_FFFD, "")[:16_000]) for text, _ in (declared, guessed)]
     return mess[0] - mess[1] >= 0.1
 
 
@@ -496,7 +515,10 @@ def decode_body(data: bytes, content_type: str | None = None) -> tuple[str, str,
         return detected[0]
 
     for enc, (text, errors, source) in lossy.items():
-        if _few_errors(text, errors) and not (enc in _CROSS_DECODING and _reads_better(data, guess(), enc)):
+        # The other declaration is a reading to compare with as well: where the header and the
+        # <meta> name two of these encodings, the bytes can be in either.
+        if _few_errors(text, errors) and not (enc in _CROSS_DECODING and any(
+                _reads_better(data, other, enc) for other in dict.fromkeys((guess(), *lossy)))):
             return text, enc, source + "-lossy"  # the declared charset, with U+FFFD for the bad bytes
 
     enc = guess()

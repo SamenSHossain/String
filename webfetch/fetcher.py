@@ -47,8 +47,17 @@ def _meta_refresh(html: bytes) -> tuple[int, str] | None:
             continue
         m = _REFRESH_URL.search(t)
         if m:
-            return int(m.group(1)), m.group(2).decode("latin-1")
+            return int(m.group(1)), _url_text(m.group(2))
     return None
+
+
+def _url_text(raw: bytes) -> str:
+    """A URL as the page wrote it. Pages are UTF-8 as a rule; bytes of another encoding are kept
+    as they are, percent-encoded (what a browser sends for them in a query)."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "".join(chr(b) if b < 0x80 else f"%{b:02X}" for b in raw)
 
 
 _HTTP_VERSIONS = {1: "1.0", 2: "1.1", 3: "2", 4: "2", 5: "2", 30: "3", 31: "3"}
@@ -192,7 +201,7 @@ class HttpFetcher:
                 # urljoin raises on a reference it cannot parse ("http://[object Object]/",
                 # "//[x"): that is a redirect to something that is not a URL.
                 try:
-                    return urljoin(current, ref)
+                    return urljoin(current, ref.replace(" ", "%20"))  # as a browser reads a space
                 except ValueError:
                     raise FetchError("invalid_redirect", f"redirected to an invalid URL: {ref[:200]!r}",
                                      hops=hops, gates=gates) from None
@@ -297,9 +306,9 @@ class HttpFetcher:
 
                 # Only a document refreshes: in plain text, JSON or XML the same tag is content
                 # (a browser shows it), and following it would answer with another resource.
-                ctype = (resp.headers.get("content-type") or "").lower()
+                media_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
                 if status == 200 and len(body) < 16384 and meta_refreshes < MAX_META_REFRESH \
-                        and ("html" in ctype or not ctype):
+                        and ("html" in media_type or not media_type):
                     # A refresh inside <noscript> only fires for browsers with JavaScript off;
                     # following it lands on "JavaScript required" pages a real visitor never sees.
                     refresh = _meta_refresh(body)
