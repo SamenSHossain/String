@@ -295,7 +295,11 @@ class HttpFetcher:
                     current = resolve(location.strip())
                     continue
 
-                if status == 200 and len(body) < 16384 and meta_refreshes < MAX_META_REFRESH:
+                # Only a document refreshes: in plain text, JSON or XML the same tag is content
+                # (a browser shows it), and following it would answer with another resource.
+                ctype = (resp.headers.get("content-type") or "").lower()
+                if status == 200 and len(body) < 16384 and meta_refreshes < MAX_META_REFRESH \
+                        and ("html" in ctype or not ctype):
                     # A refresh inside <noscript> only fires for browsers with JavaScript off;
                     # following it lands on "JavaScript required" pages a real visitor never sees.
                     refresh = _meta_refresh(body)

@@ -267,12 +267,15 @@ def review_fixes() -> None:
     env = parse_json(body)
     check("a redirect to something that is not a URL is a 502 invalid_redirect, not a 500",
           status == 502 and env.get("error") == "invalid_redirect", f"{status} {env.get('error')}")
-    page = '<html><head><meta http-equiv="refresh" content="0;url=//[x"></head><body>moved</body></html>'
-    status, h, body, _s = request("POST", "/v1/fetch", {
-        "url": "https://httpbin.org/base64/" + base64.urlsafe_b64encode(page.encode()).decode(), "render": "never"})
+    # httpbin serves this as text/plain: there the tag is the resource's text, not an instruction.
+    page = '<html><head><meta http-equiv="refresh" content="0;url=https://example.com/"></head><body>moved</body></html>'
+    plain = "https://httpbin.org/base64/" + base64.urlsafe_b64encode(page.encode()).decode()
+    status, h, body, _s = request("POST", "/v1/fetch", {"url": plain, "render": "never", "include": []})
     env = parse_json(body)
-    check("a meta refresh to something that is not a URL is a 502 invalid_redirect, not a 500",
-          status == 502 and env.get("error") == "invalid_redirect", f"{status} {env.get('error')}")
+    check("a meta refresh inside a text/plain response is not followed (only a document refreshes)",
+          status == 200 and env.get("finalUrl") == plain and env.get("redirects") == []
+          and (env.get("contentType") or "").startswith("text/plain"),
+          f"{status} {env.get('contentType')} finalUrl={(env.get('finalUrl') or '')[:40]} redirects={len(env.get('redirects') or [])}")
 
     status, h, body, _s = request("POST", "/v1/fetch", {"url": "http://lib.ru/", "render": "always", "include": ["text"]})
     env = parse_json(body)

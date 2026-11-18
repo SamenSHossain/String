@@ -542,3 +542,23 @@ def test_browser_hop_report_is_capped_to_the_newest_hops():
     assert hops[1]["location"] is None  # a document that navigated on redirected nowhere by header
     assert browser._hops([]) == [] == browser._hops([response(0, 200)])
     assert browser._hops([object(), response(1, 200)]) == []  # reporting hops never costs the page
+
+
+# --- A meta refresh is followed in a document, and is content anywhere else ----------------
+
+@pytest.mark.parametrize("ctype, followed", [
+    ("text/html", True), ("text/html; charset=utf-8", True), ("application/xhtml+xml", True),
+    ("text/plain", False), ("text/plain; charset=utf-8", False), ("application/json", False),
+    ("application/xml", False), ("text/markdown", False),
+])
+def test_meta_refresh_is_followed_only_in_html(server, settings, ctype, followed):
+    port = server.server_address[1]
+    url = f"http://127.0.0.1:{port}/r2s/refresh?url=%2Fproduct&ctype={quote(ctype, safe='')}"
+    env = run(_pipeline(settings, FetchOptions(url=url, render="never", format="json")))
+    assert env["ok"] is True
+    if followed:
+        assert env["finalUrl"] == f"http://127.0.0.1:{port}/product" and _hops(env) == [(url, 200)]
+    else:  # the resource that was asked for, with the tag as part of its text
+        assert env["finalUrl"] == url and _hops(env) == []
+        assert env["contentType"].startswith(ctype.split(";")[0])
+

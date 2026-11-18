@@ -298,7 +298,8 @@ report `fetch, process, total`.
      threads per container; a slot is freed when its thread really ends, and analysis that
      outlives the request's `timeout` (it always gets at least 2 s) is a `504`.
    - A redirect or meta refresh to something that is not a URL is a `502`
-     (`invalid_redirect`), like any other destination problem.
+     (`invalid_redirect`), like any other destination problem. A meta refresh is followed
+     only in an HTML response: in plain text, JSON or XML the same tag is content.
    - An unexpected error is a JSON `500` (`internal_error`, with its `requestId`), never a
      bare one, and in a batch it fails only its own item.
    - Fetched pages are served with `Content-Security-Policy: sandbox`.
@@ -368,7 +369,7 @@ binary content requested as markdown/text/html (`ok: false`); `429` rate limited
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q                                   # 751 tests; a local server emulates the Steam,
+pytest -q                                   # 759 tests; a local server emulates the Steam,
                                             # DPG, ZEIT and Golem gate flows
 python -m webfetch.cli https://www.nu.nl/   # one fetch, JSON line out
 uvicorn --factory webfetch.api:create_app   # local API on :8000

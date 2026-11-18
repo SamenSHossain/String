@@ -96,7 +96,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/r2s/refresh":  # a page whose <meta refresh> points wherever ?url= says (sent as is)
             return self._send(200, '<html><head><title>Moving</title><meta http-equiv="refresh" content="0;url='
                                    + qs["url"][0] + '"></head><body><p>' + "This page has moved. " * 30
-                              + "</p></body></html>")
+                              + "</p></body></html>",
+                              headers={"Content-Type": qs["ctype"][0]} if "ctype" in qs else None)
         if path == "/r2s/big":
             return self._send(200, "<html><body><p>" + "x" * 200_000 + "</p></body></html>")
         if path == "/r2s/js-redirect":  # a page whose script navigates wherever ?url= says
