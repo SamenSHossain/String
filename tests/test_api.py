@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+from tests import fakedns
+from tests.conftest import LEGACY_SAMPLES
+from webfetch import fetcher as fetcher_mod
+from webfetch.api import create_app
+from webfetch.config import Settings
+
+
+@pytest.fixture(autouse=True)
+def fake_dns(monkeypatch):
+    import webfetch.api as api_mod
+    monkeypatch.setattr(fetcher_mod, "resolve_public", fakedns.resolve)
+    monkeypatch.setattr(api_mod, "resolve_public", fakedns.resolve)
+
+
+@pytest.fixture()
+def client():
+    app = create_app(Settings(allow_private=True, anon_rate_per_min=1000))
+    with TestClient(app) as c:
+        yield c
+
+
+def test_json_envelope(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://store.steampowered.com:{port}/app/271590/"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] and body["outcome"] == "ok" and body["statusCode"] == 200
+    assert body["requestId"] == r.headers["x-request-id"]
+    assert "Grand Theft Auto V" in body["markdown"]
+    assert body["metadata"]["title"].startswith("Grand Theft Auto V")
+    assert r.headers["x-status-code"] == "200" and r.headers["x-outcome"] == "ok"
+    assert "steam:age_gate:preset" in r.headers["x-gates"]
+    assert "total;dur=" in r.headers["server-timing"]
+
+
+def test_markdown_format_headers(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://www.nu.nl:{port}/", "format": "markdown"})
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/markdown")
+    assert r.headers["x-final-url"].endswith("/")
+    assert "Het laatste nieuws" in r.text
+
+
+def test_string_compat_fields(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://www.zeit.de:{port}/index", "format": "markdown",
+                                       "mainContentOnly": True, "executeJS": False})
+    assert r.status_code == 200 and "Politik" in r.text
+
+
+def test_failure_is_502_with_reason(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/challenge", "format": "markdown"})
+    assert r.status_code == 502
+    body = r.json()
+    assert body["outcome"] == "challenge" and "markdown" not in body
+
+
+def test_validation_errors(client):
+    r = client.post("/v1/fetch", json={"url": "https://example.com", "bogus": 1})
+    assert r.status_code == 400 and r.json()["error"] == "validation_error"
+    r = client.post("/v1/fetch", json={"url": "ftp://example.com"})
+    assert r.status_code == 400 and r.json()["error"] == "invalid_url"
+    r = client.post("/v1/fetch", json={"url": "https://example.com", "headers": {"Host": "evil"}})
+    assert r.status_code == 400
+    r = client.post("/v1/fetch", json={"url": "https://example.com", "jsonSchema": {"title": "string"}})
+    assert r.status_code == 400
+
+
+def test_ssrf_blocked(monkeypatch):
+    app = create_app(Settings(allow_private=False))
+    with TestClient(app) as c:
+        r = c.post("/v1/fetch", json={"url": "http://169.254.169.254/latest/meta-data/"})
+    assert r.status_code == 403 and r.json()["error"] == "blocked_destination"
+
+
+def test_rate_limit():
+    app = create_app(Settings(allow_private=True, anon_rate_per_min=2))
+    with TestClient(app) as c:
+        codes = [c.post("/v1/fetch", json={"url": "ftp://x"}).status_code for _ in range(4)]
+    assert codes[:2] == [400, 400] and codes[2] == 429
+
+
+def test_batch(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/batch", json={"requests": [
+        {"url": f"http://store.steampowered.com:{port}/app/271590/", "include": ["metadata"]},
+        {"url": f"http://echo.test:{port}/empty"},
+    ]})
+    assert r.status_code == 200
+    res = r.json()["results"]
+    assert res[0]["ok"] is True and res[1]["outcome"] == "empty"
+
+
+def test_batch_costs_one_token_per_item():
+    app = create_app(Settings(allow_private=True, anon_rate_per_min=3))
+    with TestClient(app) as c:
+        r = c.post("/v1/batch", json={"requests": [{"url": "ftp://x"}] * 4})
+    assert r.status_code == 429
+
+
+def test_rate_limit_uses_rightmost_forwarded_for():
+    app = create_app(Settings(allow_private=True, anon_rate_per_min=1))
+    with TestClient(app) as c:
+        a = c.post("/v1/fetch", json={"url": "ftp://x"}, headers={"x-forwarded-for": "1.1.1.1, 9.9.9.9"})
+        b = c.post("/v1/fetch", json={"url": "ftp://x"}, headers={"x-forwarded-for": "2.2.2.2, 9.9.9.9"})
+    assert a.status_code == 400 and b.status_code == 429  # spoofed left entry does not help
+
+
+def test_raw_utf8_location_does_not_500(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/utf8-redirect", "format": "markdown"})
+    assert r.status_code == 200, r.text
+    assert r.headers["x-final-url"].endswith("/caf%C3%A9-r%C3%A9sum%C3%A9")
+
+
+def test_soft_rate_limit_is_a_502_not_content(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/soft-limit", "format": "markdown"})
+    assert r.status_code == 502 and r.json()["outcome"] == "rate_limited"
+
+
+def test_raw_keeps_original_bytes_and_labels_their_charset(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/sjis", "format": "raw"})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "text/html; charset=Shift_JIS"
+    assert "日本語".encode("cp932") in r.content
+
+
+@pytest.mark.parametrize("label,codec,name", [
+    ("euc-jp", "euc_jp", "EUC-JP"), ("iso-8859-2", "iso8859_2", "ISO-8859-2"), ("windows-1255", "cp1255", "windows-1255"),
+    ("koi8-u", "koi8_u", "KOI8-U"), ("ibm866", "cp866", "IBM866"), ("big5", "big5hkscs", "Big5"),
+    ("euc-kr", "cp949", "EUC-KR"), ("macintosh", "mac_roman", "macintosh")])
+def test_raw_labels_any_legacy_charset_by_its_browser_name(server, client, label, codec, name):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/legacy/{label}/{codec}", "format": "raw"})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == f"text/html; charset={name}"
+    assert r.content.decode(codec).count(LEGACY_SAMPLES[codec]) == 20
+
+
+def test_binary_as_markdown_is_415(server, client):
+    port = server.server_address[1]
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/doc.pdf", "format": "markdown"})
+    assert r.status_code == 415 and r.json()["error"] == "unsupported_content" and r.json()["ok"] is False
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/doc.pdf", "format": "raw"})
+    assert r.status_code == 200 and r.content.startswith(b"%PDF")
+
+
+def test_invalid_selector_is_400(client):
+    r = client.post("/v1/fetch", json={"url": "https://example.com", "expect": {"selector": "div[["}})
+    assert r.status_code == 400 and r.json()["error"] == "validation_error"
+
+
+def test_timeout_is_one_budget_for_the_request(server, client):
+    import time
+    port = server.server_address[1]
+    t0 = time.monotonic()
+    r = client.post("/v1/fetch", json={"url": f"http://echo.test:{port}/slow", "timeout": 1})
+    assert r.status_code == 504 and time.monotonic() - t0 < 2.5

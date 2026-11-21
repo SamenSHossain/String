@@ -1,0 +1,114 @@
+name: test-and-deploy
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest -q
+
+  # Runs the fetch pipeline against the real target sites from the CI runner, so a
+  # site that changes its consent wall or age gate shows up here first. Informational.
+  live-recipes:
+    needs: test
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Fetch the gated targets (gates resolved)
+        run: |
+          python -m webfetch.cli --compact \
+            "https://store.steampowered.com/app/271590/Grand_Theft_Auto_V_Legacy/" \
+            "https://store.steampowered.com/app/1091500/Cyberpunk_2077/" \
+            "https://www.nu.nl/" "https://tweakers.net/" "https://www.volkskrant.nl/" "https://www.ad.nl/" \
+            "https://www.zeit.de/index" "https://www.derstandard.at/" "https://www.golem.de/" \
+            "https://www.southwest.com/" "https://www.sahibinden.com/" "https://www.ozon.ru/"
+      - name: Same targets with gate recipes disabled (what a generic fetcher sees)
+        run: |
+          python -m webfetch.cli --compact --no-gates \
+            "https://store.steampowered.com/app/271590/Grand_Theft_Auto_V_Legacy/" \
+            "https://www.nu.nl/" "https://www.zeit.de/index" "https://www.derstandard.at/" "https://www.golem.de/"
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Modal credentials
+        id: creds
+        shell: bash
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Repository secrets MODAL_TOKEN_ID / MODAL_TOKEN_SECRET are not set; skipping deploy."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Modal client
+        if: steps.creds.outputs.present == 'true'
+        run: pip install "modal==1.6.4"
+      - name: Deploy API
+        if: steps.creds.outputs.present == 'true'
+        shell: bash
+        run: |
+          # Secrets pasted into the GitHub UI often carry stray whitespace.
+          export MODAL_TOKEN_ID="$(printf '%s' "$MODAL_TOKEN_ID" | tr -d '[:space:]')"
+          export MODAL_TOKEN_SECRET="$(printf '%s' "$MODAL_TOKEN_SECRET" | tr -d '[:space:]')"
+          echo "::add-mask::$MODAL_TOKEN_SECRET"
+          echo "token id prefix: ${MODAL_TOKEN_ID:0:3}, secret prefix: ${MODAL_TOKEN_SECRET:0:3}, secret length: ${#MODAL_TOKEN_SECRET}"
+          modal deploy modal_app.py 2>&1 | tee deploy.log
+      - name: Deploy headless-browser tier
+        if: steps.creds.outputs.present == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          export MODAL_TOKEN_ID="$(printf '%s' "$MODAL_TOKEN_ID" | tr -d '[:space:]')"
+          export MODAL_TOKEN_SECRET="$(printf '%s' "$MODAL_TOKEN_SECRET" | tr -d '[:space:]')"
+          echo "::add-mask::$MODAL_TOKEN_SECRET"
+          modal deploy modal_browser.py 2>&1 | tee deploy-browser.log
+      - name: Smoke test the deployed endpoint
+        if: steps.creds.outputs.present == 'true'
+        shell: bash
+        run: |
+          export MODAL_TOKEN_ID="$(printf '%s' "$MODAL_TOKEN_ID" | tr -d '[:space:]')"
+          export MODAL_TOKEN_SECRET="$(printf '%s' "$MODAL_TOKEN_SECRET" | tr -d '[:space:]')"
+          echo "::add-mask::$MODAL_TOKEN_SECRET"
+          URL="$(python -c 'import modal; print(modal.Function.from_name("webfetch", "api").get_web_url())')"
+          echo "Endpoint: $URL"
+          echo "### Endpoint: $URL" >> "$GITHUB_STEP_SUMMARY"
+          python bench/smoke.py "$URL" | tee smoke.jsonl
+      - name: Upload smoke results
+        if: steps.creds.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-results
+          path: |
+            smoke.jsonl
+            deploy.log
+            deploy-browser.log
